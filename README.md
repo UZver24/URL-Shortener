@@ -4,6 +4,168 @@
 
 Разработать микросервисный сокращатель ссылок (URL Shortener) на языке Go с использованием PostgreSQL. Проект учебный: главное — не скорость разработки, а понимание каждого шага и применение практик, которые спрашивают на технических собеседованиях в Ozon, Яндекс и других крупных компаниях.
 
+## Быстрый старт
+
+### Требования
+
+- Go 1.22+
+- Docker и Docker Compose
+- curl (для тестирования API)
+
+### 1. Клонировать репозиторий
+
+```bash
+git clone https://github.com/UZver24/URL-Shortener.git
+cd URL-Shortener
+```
+
+### 2. Настроить конфигурацию
+
+```bash
+cp .env.example .env
+# Отредактировать .env при необходимости (по умолчанию всё работает)
+```
+
+### 3. Запустить PostgreSQL
+
+```bash
+docker-compose up -d
+```
+
+Проверить, что БД запустилась:
+
+```bash
+docker-compose ps
+```
+
+### 4. Запустить приложение
+
+**Вариант A: через `go run` (для разработки)**
+
+```bash
+go run ./cmd/api
+```
+
+**Вариант B: собрать бинарник и запустить**
+
+```bash
+go build -o url-shortener ./cmd/api
+./url-shortener
+```
+
+Приложение запустится на `http://localhost:8080`.
+
+### 5. Проверить работу API
+
+**Создать короткую ссылку:**
+
+```bash
+curl -X POST http://localhost:8080/api/v1/links \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://github.com"}'
+```
+
+Ответ:
+
+```json
+{"short":"abc123","original":"https://github.com"}
+```
+
+**Перейти по короткой ссылке (редирект):**
+
+```bash
+curl -v http://localhost:8080/abc123
+# HTTP/1.1 302 Found
+# Location: https://github.com
+```
+
+**Получить статистику:**
+
+```bash
+curl http://localhost:8080/api/v1/links/abc123/stats
+```
+
+Ответ:
+
+```json
+{
+  "short": "abc123",
+  "original": "https://github.com",
+  "clicks": 1,
+  "created_at": "2026-09-10T20:51:53+03:00",
+  "last_accessed_at": "2026-09-10T20:52:17+03:00"
+}
+```
+
+**Удалить ссылку:**
+
+```bash
+curl -X DELETE http://localhost:8080/api/v1/links/abc123
+# HTTP 204 No Content
+```
+
+### 6. Запустить тесты
+
+```bash
+go test -v ./...
+```
+
+Ожидаемый результат:
+
+```
+ok  	github.com/UZver24/URL-Shortener/internal/handler	(coverage: 88.5%)
+ok  	github.com/UZver24/URL-Shortener/internal/service	(coverage: 84.3%)
+```
+
+### 7. Остановить приложение и БД
+
+```bash
+# Остановить приложение: Ctrl+C в терминале с go run
+
+# Остановить PostgreSQL
+docker-compose down
+
+# Остановить PostgreSQL и удалить данные
+docker-compose down -v
+```
+
+---
+
+## API Endpoints
+
+| Метод | Путь | Описание | Коды ответа |
+|-------|------|----------|-------------|
+| `POST` | `/api/v1/links` | Создать короткую ссылку | 201, 400, 409 |
+| `GET` | `/{short}` | Редирект на оригинальный URL | 302, 404 |
+| `GET` | `/api/v1/links/{short}/stats` | Получить статистику | 200, 404 |
+| `DELETE` | `/api/v1/links/{short}` | Удалить ссылку | 204, 404 |
+
+### Примеры запросов
+
+**Создание ссылки с custom_code:**
+
+```bash
+curl -X POST http://localhost:8080/api/v1/links \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://google.com", "custom_code": "google"}'
+```
+
+**Обработка ошибок:**
+
+```bash
+# Невалидный URL
+curl -X POST http://localhost:8080/api/v1/links \
+  -H "Content-Type: application/json" \
+  -d '{"url": "not-a-url"}'
+# 400 Bad Request: {"error": "Invalid input"}
+
+# Несуществующая ссылка
+curl http://localhost:8080/nonexistent
+# 404 Not Found: {"error": "Link not found"}
+```
+
+---
+
 ## Технологический стек
 
 - **Язык:** Go (версия 1.22+)

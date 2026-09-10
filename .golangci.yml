@@ -1,0 +1,22 @@
+run:
+  timeout: 5m
+
+linters:
+  disable-all: true
+  enable:
+    - gofmt
+    - errcheck
+    - staticcheck
+    - unused
+
+linters-settings:
+  staticcheck:
+    checks:
+      - all
+      - '-SA1019'  # отключаем проверку deprecated
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - errcheck

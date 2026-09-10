@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"net/url"
 	"time"
@@ -22,25 +23,33 @@ type LinkRepository interface {
 
 // LinkService реализует бизнес-логику для работы со ссылками
 type LinkService struct {
-	repo LinkRepository
+	repo   LinkRepository
+	logger *slog.Logger
 }
 
 // NewLinkService создаёт новый сервис
-func NewLinkService(repo LinkRepository) *LinkService {
-	return &LinkService{repo: repo}
+func NewLinkService(repo LinkRepository, logger *slog.Logger) *LinkService {
+	return &LinkService{
+		repo:   repo,
+		logger: logger,
+	}
 }
 
 // CreateLink создаёт новую короткую ссылку
 func (s *LinkService) CreateLink(ctx context.Context, originalURL string, customCode string) (*model.Link, error) {
 	// Валидация URL
 	if !isValidURL(originalURL) {
+		s.logger.Warn("invalid URL provided", "url", originalURL)
 		return nil, model.ErrInvalidInput
 	}
 
 	// Проверяем, существует ли уже ссылка с таким original_url
 	existing, err := s.repo.GetByOriginalURL(ctx, originalURL)
 	if err == nil && existing != nil {
-		// Ссылка уже существует — возвращаем её
+		s.logger.Info("returning existing link",
+			"original_url", originalURL,
+			"short_code", existing.ShortCode,
+		)
 		return existing, nil
 	}
 
@@ -51,6 +60,7 @@ func (s *LinkService) CreateLink(ctx context.Context, originalURL string, custom
 	} else {
 		shortCode, err = generateShortCode()
 		if err != nil {
+			s.logger.Error("failed to generate short code", "error", err)
 			return nil, fmt.Errorf("generate short code: %w", err)
 		}
 	}
@@ -67,13 +77,23 @@ func (s *LinkService) CreateLink(ctx context.Context, originalURL string, custom
 	for attempts := 0; attempts < 3; attempts++ {
 		err = s.repo.Create(ctx, link)
 		if err == nil {
+			s.logger.Info("link created",
+				"short_code", link.ShortCode,
+				"original_url", link.OriginalURL,
+				"id", link.ID,
+			)
 			return link, nil
 		}
 
 		if err == model.ErrShortCodeAlreadyTaken {
+			s.logger.Warn("short code collision, retrying",
+				"short_code", shortCode,
+				"attempt", attempts+1,
+			)
 			// Коллизия — генерируем новый код и пробуем снова
 			shortCode, err = generateShortCode()
 			if err != nil {
+				s.logger.Error("failed to generate short code on retry", "error", err)
 				return nil, fmt.Errorf("generate short code: %w", err)
 			}
 			link.ShortCode = shortCode
@@ -81,9 +101,11 @@ func (s *LinkService) CreateLink(ctx context.Context, originalURL string, custom
 		}
 
 		// Другая ошибка — возвращаем
+		s.logger.Error("failed to create link", "error", err)
 		return nil, err
 	}
 
+	s.logger.Error("failed to create link after 3 attempts")
 	return nil, fmt.Errorf("failed to create link after 3 attempts")
 }
 
@@ -98,7 +120,12 @@ func (s *LinkService) GetOriginalURL(ctx context.Context, code string) (string, 
 	go func() {
 		// Используем background context, так как оригинальный может быть отменён
 		bgCtx := context.Background()
-		_ = s.repo.IncrementClicks(bgCtx, link.ID)
+		if err := s.repo.IncrementClicks(bgCtx, link.ID); err != nil {
+			s.logger.Error("failed to increment clicks",
+				"link_id", link.ID,
+				"error", err,
+			)
+		}
 	}()
 
 	return link.OriginalURL, nil
@@ -111,7 +138,11 @@ func (s *LinkService) GetStats(ctx context.Context, code string) (*model.Link, e
 
 // DeleteLink удаляет ссылку
 func (s *LinkService) DeleteLink(ctx context.Context, code string) error {
-	return s.repo.Delete(ctx, code)
+	err := s.repo.Delete(ctx, code)
+	if err == nil {
+		s.logger.Info("link deleted", "short_code", code)
+	}
+	return err
 }
 
 // isValidURL проверяет, является ли строка валидным URL

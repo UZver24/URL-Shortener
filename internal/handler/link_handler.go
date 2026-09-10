@@ -51,7 +51,11 @@ func (h *LinkHandler) Redirect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	originalURL, err := h.linkService.GetOriginalURL(r.Context(), code)
+	// Извлекаем User-Agent и Referer для аналитики
+	userAgent := r.UserAgent()
+	referer := r.Referer()
+
+	originalURL, err := h.linkService.GetOriginalURL(r.Context(), code, userAgent, referer)
 	if err != nil {
 		handleServiceError(w, err)
 		return

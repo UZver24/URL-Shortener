@@ -8,9 +8,26 @@ import (
 	"testing"
 	"time"
 
+	"github.com/UZver24/URL-Shortener/internal/messaging/kafka"
 	"github.com/UZver24/URL-Shortener/internal/model"
 	"github.com/UZver24/URL-Shortener/internal/worker"
 )
+
+// mockClickPublisher — мок для ClickPublisher (Kafka или воркер-пул)
+type mockClickPublisher struct {
+	publishCalls int
+	publishErr   error
+	events       []*kafka.ClickEvent
+}
+
+func (m *mockClickPublisher) Publish(ctx context.Context, event *kafka.ClickEvent) error {
+	m.publishCalls++
+	if m.publishErr != nil {
+		return m.publishErr
+	}
+	m.events = append(m.events, event)
+	return nil
+}
 
 // mockRepository — мок-репозиторий для тестов
 type mockRepository struct {
@@ -297,13 +314,14 @@ func TestCreateLink_Collision(t *testing.T) {
 // TestGetOriginalURL_Success — успешное получение URL
 func TestGetOriginalURL_Success(t *testing.T) {
 	repo := newMockRepository()
-	svc := NewLinkService(repo, testLogger(), nil, nil)
+	pub := &mockClickPublisher{}
+	svc := NewLinkService(repo, testLogger(), nil, pub)
 
 	// Создаём ссылку
 	_, _ = svc.CreateLink(context.Background(), "https://example.com", "test123")
 
 	// Получаем URL
-	url, err := svc.GetOriginalURL(context.Background(), "test123")
+	url, err := svc.GetOriginalURL(context.Background(), "test123", "TestAgent", "https://ref.com")
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
@@ -312,17 +330,22 @@ func TestGetOriginalURL_Success(t *testing.T) {
 		t.Errorf("expected 'https://example.com', got '%s'", url)
 	}
 
-	// Даём время goroutine для increment
-	time.Sleep(10 * time.Millisecond)
+	// Даём время goroutine для publish
+	time.Sleep(50 * time.Millisecond)
 
-	// Проверяем, что clicks увеличился
-	link, _ := repo.GetByCode(context.Background(), "test123")
-	if link.Clicks != 1 {
-		t.Errorf("expected clicks=1, got %d", link.Clicks)
+	// Проверяем, что событие было опубликовано
+	if pub.publishCalls != 1 {
+		t.Errorf("expected 1 publish call, got %d", pub.publishCalls)
 	}
 
-	if link.LastAccessedAt == nil {
-		t.Error("expected LastAccessedAt to be set")
+	if len(pub.events) > 0 {
+		event := pub.events[0]
+		if event.LinkID != 1 {
+			t.Errorf("expected event LinkID=1, got %d", event.LinkID)
+		}
+		if event.UserAgent != "TestAgent" {
+			t.Errorf("expected event UserAgent='TestAgent', got '%s'", event.UserAgent)
+		}
 	}
 }
 
@@ -331,7 +354,7 @@ func TestGetOriginalURL_NotFound(t *testing.T) {
 	repo := newMockRepository()
 	svc := NewLinkService(repo, testLogger(), nil, nil)
 
-	_, err := svc.GetOriginalURL(context.Background(), "nonexistent")
+	_, err := svc.GetOriginalURL(context.Background(), "nonexistent", "", "")
 	if !errors.Is(err, model.ErrLinkNotFound) {
 		t.Errorf("expected ErrLinkNotFound, got %v", err)
 	}
@@ -467,7 +490,7 @@ func TestCacheAside_GetOriginalURL_Hit(t *testing.T) {
 	cache.data["cached123"] = link
 
 	// Получаем URL
-	url, err := svc.GetOriginalURL(context.Background(), "cached123")
+	url, err := svc.GetOriginalURL(context.Background(), "cached123", "", "")
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
@@ -503,7 +526,7 @@ func TestCacheAside_GetOriginalURL_Miss(t *testing.T) {
 	}
 
 	// Получаем URL (cache miss)
-	url, err := svc.GetOriginalURL(context.Background(), "miss123")
+	url, err := svc.GetOriginalURL(context.Background(), "miss123", "", "")
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
@@ -616,7 +639,7 @@ func TestCacheAside_CacheError_FallbackToDB(t *testing.T) {
 	}
 
 	// Получаем URL (кэш сломан, должен fallback к БД)
-	url, err := svc.GetOriginalURL(context.Background(), "fallback")
+	url, err := svc.GetOriginalURL(context.Background(), "fallback", "", "")
 	if err != nil {
 		t.Fatalf("expected no error (fallback to DB), got %v", err)
 	}
@@ -653,7 +676,7 @@ func TestWorkerPool_Integration(t *testing.T) {
 	pool.Start()
 	defer pool.Stop()
 
-	svc := NewLinkService(repo, testLogger(), cache, pool)
+	svc := NewLinkService(repo, testLogger(), cache, nil)
 
 	// Создаём ссылку
 	link, err := svc.CreateLink(context.Background(), "https://worker-pool.com", "worker")
@@ -661,9 +684,13 @@ func TestWorkerPool_Integration(t *testing.T) {
 		t.Fatalf("failed to create link: %v", err)
 	}
 
+	// Создаём publisher, который отправляет задачи в воркер-пул
+	publisher := NewWorkerPoolClickPublisher(repo, pool)
+	svc = NewLinkService(repo, testLogger(), cache, publisher)
+
 	// Получаем URL несколько раз (увеличивает счётчик через pool)
 	for i := 0; i < 5; i++ {
-		_, err := svc.GetOriginalURL(context.Background(), "worker")
+		_, err := svc.GetOriginalURL(context.Background(), "worker", "", "")
 		if err != nil {
 			t.Fatalf("GetOriginalURL failed: %v", err)
 		}
@@ -681,7 +708,7 @@ func TestWorkerPool_Integration(t *testing.T) {
 	}
 }
 
-// TestWorkerPool_FallbackWhenPoolClosed — fallback к sync increment при закрытом пуле
+// TestWorkerPool_FallbackWhenPoolClosed — при закрытом пуле publisher вернёт ошибку
 func TestWorkerPool_FallbackWhenPoolClosed(t *testing.T) {
 	repo := newMockRepository()
 
@@ -695,10 +722,12 @@ func TestWorkerPool_FallbackWhenPoolClosed(t *testing.T) {
 	})
 	pool.Start()
 
-	svc := NewLinkService(repo, testLogger(), nil, pool)
+	// Создаём publisher
+	publisher := NewWorkerPoolClickPublisher(repo, pool)
+	svc := NewLinkService(repo, testLogger(), nil, publisher)
 
 	// Создаём ссылку
-	link, err := svc.CreateLink(context.Background(), "https://fallback.com", "fb")
+	_, err := svc.CreateLink(context.Background(), "https://fallback.com", "fb")
 	if err != nil {
 		t.Fatalf("failed to create link: %v", err)
 	}
@@ -706,17 +735,15 @@ func TestWorkerPool_FallbackWhenPoolClosed(t *testing.T) {
 	// Останавливаем пул
 	pool.Stop()
 
-	// Теперь pool.Submit вернёт ErrPoolClosed → fallback к sync increment
-	_, err = svc.GetOriginalURL(context.Background(), "fb")
+	// Теперь pool.Submit вернёт ErrPoolClosed → publisher вернёт ошибку, но сервис залоггирует
+	_, err = svc.GetOriginalURL(context.Background(), "fb", "", "")
 	if err != nil {
 		t.Fatalf("GetOriginalURL failed: %v", err)
 	}
 
-	// Даём время для async increment (fallback)
+	// Даём время для async publish (который вернёт ошибку)
 	time.Sleep(50 * time.Millisecond)
 
-	// Счётчик должен увеличиться
-	if link.Clicks != 1 {
-		t.Errorf("expected clicks=1 (fallback worked), got %d", link.Clicks)
-	}
+	// При использовании Kafka publisher ошибки не влияют на redirect — ссылка работает
+	// Проверяем, что GetOriginalURL не вернул ошибку (redirect успешен)
 }

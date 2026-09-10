@@ -230,7 +230,7 @@ curl http://localhost:8080/nonexistent
 - **Контейнеризация:** Docker + docker-compose
 - **Миграции:** `golang-migrate/migrate` или ручные SQL-скрипты
 - **Тестирование:** стандартный `testing` + `httptest`
-- **Очереди (этап 5):** Kafka или RabbitMQ (по желанию)
+- **Очереди (этап 5):** Apache Kafka (KRaft mode, `github.com/segmentio/kafka-go`) ✅
 
 ## Принципы работы над проектом
 
@@ -273,45 +273,75 @@ Client → HTTP API (Go) → PostgreSQL
 Client → HTTP API (Go) → Redis (кэш) → PostgreSQL
 ```
 
-### Фаза III — микросервисы
+### Фаза III — микросервисы ✅
 
 ```
-                      ┌──────────────────┐
- Client → API Gateway │  Link Service    │ → PostgreSQL (links)
-                      └────────┬─────────┘
-                               │ (события)
-                               ▼
-                      ┌──────────────────┐
-                      │      Kafka       │
-                      └────────┬─────────┘
-                               ▼
-                      ┌──────────────────┐
-                      │  Stats Service   │ → PostgreSQL (stats) / ClickHouse
-                      └──────────────────┘
+                       ┌──────────────────┐
+ Client → Gateway ────→│  Link Service    │ → PostgreSQL (links) → Redis
+                       └────────┬─────────┘
+                                │ (ClickEvent)
+                                ▼
+                       ┌──────────────────┐
+                       │      Kafka       │
+                       └────────┬─────────┘
+                                ▼
+                       ┌──────────────────┐
+                       │  Stats Service   │ → PostgreSQL (stats)
+                       └──────────────────┘
 ```
+
+**Порты:**
+- API Gateway: `8080` (единая точка входа)
+- Link Service: `8081` (CRUD + redirect)
+- Stats Service: `8082` (аналитика)
 
 На каждой фазе — обсуждение: почему переходим, какие проблемы решаем, какие появляются новые.
 
-## Структура проекта (рекомендуемая)
+## Структура проекта (актуальная, Фаза III)
 
 ```
 url-shortener/
 ├── cmd/
-│   └── api/
-│       └── main.go              # точка входа
+│   ├── api/                         # Монолит (Фаза I-II, обратная совместимость)
+│   │   ├── main.go
+│   │   └── migrations/*.sql
+│   ├── link-service/                # Link Service (CRUD + redirect + Kafka producer)
+│   │   ├── main.go
+│   │   └── migrations/*.sql
+│   ├── stats-service/               # Stats Service (Kafka consumer + аналитика)
+│   │   ├── main.go
+│   │   └── migrations/*.sql
+│   └── gateway/                     # API Gateway (reverse proxy)
+│       └── main.go
 ├── internal/
-│   ├── config/                  # конфигурация из env
-│   ├── handler/                 # HTTP-обработчики
-│   │   └── middleware/          # RequestID, Logging, Metrics
-│   ├── service/                 # бизнес-логика
-│   ├── repository/              # работа с БД
-│   │   ├── postgres/            # PostgreSQL
-│   │   └── redis/               # Redis кэш
-│   ├── worker/                  # воркер-пул для асинхронных задач
-│   └── model/                   # доменные типы
-├── migrations/                  # SQL-миграции
-├── docker-compose.yml
-├── Dockerfile
+│   ├── config/                      # Конфигурация из env
+│   ├── handler/                     # HTTP-обработчики
+│   │   ├── link_handler.go          # Link Service handlers
+│   │   ├── stats_handler.go         # Stats Service handlers
+│   │   ├── health_handler.go        # Health-check
+│   │   └── middleware/              # RequestID, Logging, Metrics
+│   ├── messaging/
+│   │   └── kafka/                   # Kafka producer/consumer
+│   │       ├── events.go            # ClickEvent + сериализация
+│   │       ├── producer.go          # Publisher
+│   │       └── consumer.go          # Consumer с retry
+│   ├── service/                     # Бизнес-логика
+│   │   ├── link_service.go          # Link Service
+│   │   └── stats_service.go         # Stats Service
+│   ├── repository/
+│   │   ├── postgres/                # PostgreSQL
+│   │   │   ├── link_repo.go         # Links CRUD
+│   │   │   ├── postgres.go          # Connection pool
+│   │   │   └── stats/               # Stats repository
+│   │   │       └── stats_repo.go
+│   │   └── redis/                   # Redis cache
+│   ├── worker/                      # Worker pool (монолит, обратная совместимость)
+│   └── model/                       # Доменные типы
+├── docker-compose.yml               # PostgreSQL + Redis + Kafka + 3 сервиса
+├── Dockerfile.link-service          # Dockerfile для Link Service
+├── Dockerfile.stats-service         # Dockerfile для Stats Service
+├── Dockerfile.gateway               # Dockerfile для API Gateway
+├── Dockerfile                       # Dockerfile для монолита
 ├── go.mod
 ├── go.sum
 └── README.md
@@ -362,11 +392,14 @@ url-shortener/
 - Обсуждение: когда каналы, а когда мьютексы.
 - Метрики воркер-пула (queue size, processed, errors).
 
-### Этап 5. Микросервисы
+### Этап 5. Микросервисы ✅
 
-- Выделение Stats Service.
-- Общение через Kafka (или REST, если Kafka сложна).
-- Обсуждение: зачем микросервисы, какие проблемы решают, какие создают.
+- Разделение монолита на Link Service и Stats Service
+- Apache Kafka для асинхронной коммуникации (события кликов)
+- API Gateway для единой точки входа
+- Graceful shutdown для producer/consumer
+- Event-driven архитектура: ClickEvent → Kafka → Stats Service
+- Обновлён `INTERVIEW.md`: Monolith vs Microservices, Kafka, CAP, Saga pattern
 
 ### Этап 6. Оптимизация (алгоритмы)
 

@@ -8,8 +8,8 @@
 **URL Shortener** — учебный микросервисный сокращатель ссылок на Go + PostgreSQL.
 Цель — подготовка к техническим собеседованиям в Ozon, Яндекс и другие крупные компании.
 
-**Текущая фаза:** Фаза II — Кэширование (Этапы 3-4) ✅ ЗАВЕРШЕНА
-**Завершено:** Фаза I — Монолит (тег `v1.0.0-monolith`), Фаза II — Кэш + Воркер-пул
+**Текущая фаза:** Фаза III — Микросервисы (Этап 5) ✅ ЗАВЕРШЕНА
+**Завершено:** Фаза I — Монолит (тег `v1.0.0-monolith`), Фаза II — Кэш + Воркер-пул, Фаза III — Микросервисы + Kafka
 
 ## Ключевые файлы
 
@@ -24,18 +24,26 @@
 
 ## Команды
 
-### Запуск
+### Запуск (микросервисы)
 
 ```bash
-# Запустить PostgreSQL + API через Docker Compose
+# Запустить все микросервисы через Docker Compose
 docker-compose up --build
 
-# Или только PostgreSQL, а приложение локально
-docker-compose up -d postgres
-go run ./cmd/api
+# Запустить только инфраструк (PostgreSQL + Redis + Kafka)
+docker-compose up -d postgres redis kafka
 
-# Собрать бинарник
-go build -o url-shortener ./cmd/api
+# Запустить Link Service локально
+SERVICE_NAME=link-service go run ./cmd/link-service
+
+# Запустить Stats Service локально
+SERVICE_NAME=stats-service go run ./cmd/stats-service
+
+# Запустить Gateway локально
+SERVICE_NAME=gateway go run ./cmd/gateway
+
+# Запустить монолит (обратная совместимость)
+go run ./cmd/api
 ```
 
 ### Тестирование
@@ -69,22 +77,48 @@ curl http://localhost:8080/metrics
 
 ```
 URL-Shortener/
-├── cmd/api/
-│   ├── main.go                        # Точка входа
-│   └── migrations/*.sql               # SQL-миграции (встроены через //go:embed)
+├── cmd/
+│   ├── api/                             # Монолит (Фаза I-II, обратная совместимость)
+│   │   ├── main.go
+│   │   └── migrations/*.sql
+│   ├── link-service/                    # Link Service (CRUD + redirect)
+│   │   ├── main.go
+│   │   └── migrations/*.sql
+│   ├── stats-service/                   # Stats Service (Kafka consumer + аналитика)
+│   │   ├── main.go
+│   │   └── migrations/*.sql
+│   └── gateway/                         # API Gateway (reverse proxy)
+│       └── main.go
 ├── internal/
-│   ├── config/                        # Загрузка конфигурации из env
-│   ├── handler/                       # HTTP-обработчики (внешний слой)
-│   │   └── middleware/                # RequestID, Logging, Metrics
-│   ├── service/                       # Бизнес-логика (средний слой)
-│   ├── repository/                    # Работа с данными (внутренний слой)
-│   │   ├── postgres/                  # Реализация для PostgreSQL
-│   │   └── cache/                     # Реализация для Redis (Этап 3)
-│   ├── model/                         # Доменные типы и ошибки
-│   └── worker/                        # Воркер-пул (Этап 4)
-├── docker-compose.yml                 # PostgreSQL + API (и Redis в Этапе 3)
-├── Dockerfile                         # Multi-stage build
-├── .env.example                       # Шаблон переменных окружения
+│   ├── config/                          # Загрузка конфигурации из env
+│   ├── handler/                         # HTTP-обработчики (внешний слой)
+│   │   ├── link_handler.go              # Link Service handlers
+│   │   ├── stats_handler.go             # Stats Service handlers
+│   │   ├── health_handler.go            # Health-check
+│   │   └── middleware/                  # RequestID, Logging, Metrics
+│   ├── messaging/                       # Messaging
+│   │   └── kafka/                       # Kafka producer/consumer
+│   │       ├── events.go               # ClickEvent + сериализация
+│   │       ├── producer.go             # Publisher
+│   │       └── consumer.go             # Consumer с retry
+│   ├── service/                         # Бизнес-логика (средний слой)
+│   │   ├── link_service.go             # Link Service
+│   │   └── stats_service.go            # Stats Service
+│   ├── repository/                      # Работа с данными (внутренний слой)
+│   │   ├── postgres/                   # PostgreSQL
+│   │   │   ├── link_repo.go            # Links CRUD
+│   │   │   ├── postgres.go             # Connection pool
+│   │   │   └── stats/                  # Stats repository
+│   │   │       └── stats_repo.go
+│   │   └── redis/                      # Redis cache
+│   ├── model/                          # Доменные типы и ошибки
+│   └── worker/                         # Воркер-пул (монолит, обратная совместимость)
+├── docker-compose.yml                  # PostgreSQL + Redis + Kafka + 3 сервиса
+├── Dockerfile.link-service             # Dockerfile для Link Service
+├── Dockerfile.stats-service            # Dockerfile для Stats Service
+├── Dockerfile.gateway                  # Dockerfile для Gateway
+├── Dockerfile                          # Dockerfile для монолита
+├── .env.example                        # Шаблон переменных окружения
 └── go.mod
 ```
 
@@ -200,12 +234,14 @@ Handler (HTTP) → Service (бизнес-логика) → Repository (данн�
 - Exponential backoff при ошибках
 - Метрики воркер-пула
 
-## Следующий план (Фаза III — Микросервисы)
+## Следующий план (Фаза III — Оптимизация)
 
-**Этап 5. Микросервисы** — следующий:
-- Выделение Stats Service
-- Общение через Kafka (или REST, если Kafka сложна)
-- Обсуждение: зачем микросервисы, какие проблемы решают, какие создают
+**Этап 6. Оптимизация (алгоритмы)** — следующий:
+- HyperLogLog для уникальных переходов
+- Sorted Sets для топа ссылок
+- Bloom Filter для проверки существования
+- Base62 vs Snowflake ID
+- Нагрузочное тестирование
 
 ## Чего НЕ делать
 

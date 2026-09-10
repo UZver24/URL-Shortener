@@ -1,4 +1,6 @@
 services:
+  # ==================== Инфраструктура ====================
+
   postgres:
     image: postgres:16-alpine
     container_name: url-shortener-db
@@ -29,27 +31,126 @@ services:
       timeout: 5s
       retries: 5
 
-  api:
-    build: .
-    container_name: url-shortener-api
+  # Kafka без Zookeeper (KRaft mode) — проще для разработки
+  kafka:
+    image: bitnami/kafka:3.7
+    container_name: url-shortener-kafka
+    ports:
+      - "9092:9092"   # Для подключения из контейнеров
+      - "9094:9094"   # Для подключения с хост-машины
     environment:
+      # KRaft mode (без Zookeeper)
+      KAFKA_CFG_NODE_ID: 0
+      KAFKA_CFG_PROCESS_ROLES: controller,broker
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 0@kafka:9093
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # Listeners
+      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Topic defaults
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ==================== Микросервисы ====================
+
+  # Link Service — CRUD + redirect
+  link-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.link-service
+    container_name: url-shortener-link-service
+    environment:
+      # PostgreSQL
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
       POSTGRES_USER: shortener
       POSTGRES_PASSWORD: secret
       POSTGRES_DB: shortener
-      SERVER_PORT: 8080
+      # Redis
       REDIS_HOST: redis
       REDIS_PORT: 6379
       REDIS_PASSWORD: ""
       REDIS_DB: 0
       REDIS_TTL: 3600
+      # Kafka
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_CLICKS_TOPIC: link.clicks
+      # Server
+      SERVER_PORT: 8081
+      SERVICE_NAME: link-service
     ports:
-      - "8080:8080"
+      - "8081:8081"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8081/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Stats Service — аналитика и статистика
+  stats-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.stats-service
+    container_name: url-shortener-stats-service
+    environment:
+      # PostgreSQL
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: shortener
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: shortener
+      # Kafka
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_CLICKS_TOPIC: link.clicks
+      KAFKA_CONSUMER_GROUP: stats-service
+      # Server
+      SERVER_PORT: 8082
+      SERVICE_NAME: stats-service
+    ports:
+      - "8082:8082"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8082/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # API Gateway — единая точка входа
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    container_name: url-shortener-gateway
+    environment:
+      LINK_SERVICE_URL: http://link-service:8081
+      STATS_SERVICE_URL: http://stats-service:8082
+      SERVER_PORT: 8080
+      SERVICE_NAME: gateway
+    ports:
+      - "8080:8080"
+    depends_on:
+      link-service:
+        condition: service_healthy
+      stats-service:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1"]

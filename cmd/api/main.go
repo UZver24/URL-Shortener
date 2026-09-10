@@ -116,7 +116,8 @@ func main() {
 	)
 
 	// 9. Создаём сервис с кэшем и воркер-пулом
-	linkService := service.NewLinkService(linkRepo, logger, linkCache, workerPool)
+	publisher := service.NewWorkerPoolClickPublisher(linkRepo, workerPool)
+	linkService := service.NewLinkService(linkRepo, logger, linkCache, publisher)
 	linkHandler := handler.NewLinkHandler(linkService)
 
 	// Создаём HealthHandler с Redis (если доступен)

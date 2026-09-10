@@ -2869,3 +2869,455 @@ Batch processing — опциональное улучшение для Этап
 ## Следующий этап
 
 После изучения этих вопросов переходим к **Этапу 5: Микросервисы** (выделение Stats Service, Kafka).
+
+---
+
+# Этап 5: Микросервисы — вопросы и ответы
+
+> **Что реализовано:**
+> - Разделение монолита на **Link Service** и **Stats Service**
+> - **Apache Kafka** для асинхронной коммуникации (события кликов)
+> - **API Gateway** для единой точки входа
+> - Независимое масштабирование сервисов
+> - Graceful shutdown для producer и consumer
+
+---
+
+## 1. Monolith vs Microservices
+
+### Вопрос: Когда стоит переходить от монолита к микросервисам?
+
+**Ответ:**
+
+Переход к микросервисам оправдан, когда:
+
+1. **Масштабирование:** разные части системы требуют разного масштабирования. В нашем случае: redirect (`GET /{short}`) — это high-load read операция, а аналитика — write-heavy нагрузка. Разделяя их, мы можем масштабировать Link Service горизонтально (много реплик), а Stats Service — независимо.
+
+2. **Команда:** когда над разными частями системы работают разные команды. Каждая команда владеет своим сервисом (full ownership).
+
+3. **Независимый деплой:** можно обновить статистику, не трогая redirect.
+
+4. **Изоляция сбоев:** падение Stats Service не ломает redirect (критичный для пользователей endpoint).
+
+**Когда НЕ стоит:**
+- Маленькая команда (1-3 человека)
+- MVP или прототип
+- Нет опыта с распределёнными системами
+- Нет инструментов observability (мониторинг, трейсинг)
+
+**Золотое правило (Martin Fowler):** «Monolith first» — начните с монолита и выделяйте микросервисы, когда монолит станет bottleneck.
+
+---
+
+## 2. Границы сервисов (Bounded Context)
+
+### Вопрос: Как определить границы между микросервисами?
+
+**Ответ:**
+
+Используем **Domain-Driven Design (DDD)** концепцию **Bounded Context**:
+
+**В нашем проекте:**
+
+| Сервис | Граница | Данные | Ответственность |
+|--------|---------|--------|-----------------|
+| **Link Service** | CRUD + Redirect | `links` таблица | Создание, удаление, redirect |
+| **Stats Service** | Аналитика | `link_stats`, `click_events` | Агрегация кликов, отчёты |
+
+**Принципы:**
+- **Single Responsibility:** каждый сервис делает одну вещь
+- **Data Ownership:** каждый сервис владеет своими данными
+- **Loose Coupling:** минимум зависимостей между сервисами
+
+**Плохой пример:** создать отдельный сервис для каждого CRUD — это over-engineering. Микросервис должен представлять законченный бизнес-контекст.
+
+---
+
+## 3. Apache Kafka: основы
+
+### Вопрос: Что такое Kafka и зачем она нужна?
+
+**Ответ:**
+
+**Apache Kafka** — это распределённая платформа потоковой обработки событий (event streaming).
+
+**Ключевые концепции:**
+
+```
+Producer → [Topic] → Consumer Group → Consumers
+            │
+            ├── Partition 0 → Consumer 1
+            ├── Partition 1 → Consumer 2
+            └── Partition 2 → Consumer 3
+```
+
+- **Topic:** логический канал (например, `link.clicks`)
+- **Partition:** физическое разделение topic для параллелизма
+- **Producer:** публикует сообщения в topic
+- **Consumer:** читает сообщения из topic
+- **Consumer Group:** группа consumers, где каждое сообщение обрабатывается одним consumer
+- **Offset:** позиция consumer в partition (для resumability)
+- **Broker:** сервер Kafka (кластер = несколько брокеров)
+
+**Почему Kafka, а не RabbitMQ?**
+
+| Критерий | Kafka | RabbitMQ |
+|----------|-------|----------|
+| Модель | Log-based (append-only) | Queue-based |
+| Retention | Сохраняет сообщения N дней | Удаляет после ack |
+| Throughput | Миллионы msg/sec | Тысячи msg/sec |
+| Replay | Можно переиграть события | Нельзя |
+| Use case | Event streaming, CQRS | Task queues, RPC |
+
+**В нашем проекте:** Kafka идеальна для событий кликов — мы можем переиграть историю (replay), если Stats Service сломается, и добавить новые consumers (например, для ML-аналитики) без изменения Link Service.
+
+---
+
+## 4. Event-Driven Architecture
+
+### Вопрос: Что такое event-driven архитектура?
+
+**Ответ:**
+
+**Event-Driven Architecture (EDA)** — стиль архитектуры, где сервисы общаются через асинхронные события.
+
+**Паттерны EDA:**
+
+1. **Event Notification:** событие как сигнал («клик произошёл»)
+2. **Event Sourcing:** состояние определяется последовательностью событий
+3. **CQRS (Command Query Responsibility Segregation):** раздельные модели для записи и чтения
+
+**В нашем проекте:**
+```
+Link Service:  redirect → publish ClickEvent → Kafka
+Stats Service: Kafka → consume ClickEvent → update DB
+```
+
+**Преимущества:**
+- **Decoupling:** Link Service не знает о Stats Service
+- **Scalability:** можно добавить N consumers
+- **Resilience:** если Stats Service упал, события накапливаются в Kafka
+
+**Недостатки:**
+- **Eventual consistency:** статистика обновляется не мгновенно
+- **Complexity:** нужно обрабатывать идемпотентность, retry, dead letter queue
+- **Debugging:** сложнее отследить цепочку событий
+
+---
+
+## 5. Синхронная vs Асинхронная коммуникация
+
+### Вопрос: Когда использовать REST/gRPC, а когда Kafka?
+
+**Ответ:**
+
+| Критерий | Синхронная (REST/gRPC) | Асинхронная (Kafka) |
+|----------|----------------------|-------------------|
+| Задержка | Нужен ответ немедленно | Ответ не нужен (fire-and-forget) |
+| Доступность | Если callee упал — caller тоже | Сообщения накапливаются |
+| Coupling | Tight (caller знает URL callee) | Loose (через broker) |
+| Масштабирование | Load balancing на callee | Consumers масштабируются независимо |
+
+**В нашем проекте:**
+
+- **Redirect → Kafka (асинхронно):** не блокируем пользователя, ждущего redirect, ради обновления статистики
+- **GetStats → REST (синхронно):** пользователю нужен ответ сразу
+
+**gRPC vs REST:**
+- **gRPC:** бинарный (Protobuf), streaming, bidirectional, быстрее. Для service-to-service.
+- **REST:** JSON, human-readable, кэширование, browser-friendly. Для внешних API.
+
+---
+
+## 6. Kafka Producer: реализация
+
+### Вопрос: Как реализовать надёжный Kafka producer?
+
+**Ответ:**
+
+**Наша реализация:**
+
+```go
+writer := &kafkago.Writer{
+    Addr:         kafkago.TCP(brokers...),
+    Topic:        topic,
+    Balancer:     &kafkago.LeastBytes{},
+    RequiredAcks: kafkago.RequireOne, // Ждём ack от leader
+    MaxAttempts:  3,                   // Retry при ошибках
+    BatchSize:    100,                 // Batch для throughput
+    BatchTimeout: 10 * time.Millisecond,
+}
+```
+
+**Ключевые решения:**
+
+1. **RequiredAcks = RequireOne:** компромисс между скоростью и надёжностью. Leader подтверждает запись. `RequireAll` надёжнее, но медленнее.
+
+2. **Partitioning по link_id:** все клики одной ссылки попадают в одну партицию → гарантия порядка для конкретной ссылки.
+
+3. **Batching:** группируем сообщения для снижения latency и нагрузки на брокер.
+
+4. **Graceful shutdown:** `writer.Close()` сбрасывает буфер перед завершением.
+
+---
+
+## 7. Kafka Consumer: реализация
+
+### Вопрос: Как обеспечить надёжную обработку сообщений в consumer?
+
+**Ответ:**
+
+**Атомарная обработка + коммит offset:**
+
+```
+1. Fetch message (не коммитим offset)
+2. Process message (запись в БД)
+3. Commit offset (только после успешной обработки)
+```
+
+**Почему не auto-commit?**
+
+- **Auto-commit** коммитит offset по таймеру, даже если обработка не завершена
+- Если consumer упадёт между auto-commit и обработкой → сообщение потеряно
+- **Manual commit** гарантирует at-least-once delivery
+
+**Что если обработка провалилась?**
+
+```go
+// Exponential backoff: 1s, 2s, 4s, 8s, 16s
+for attempt := 0; attempt < maxRetries; attempt++ {
+    if err := handler(ctx, event); err == nil {
+        reader.CommitMessages(ctx, msg)
+        return
+    }
+    time.Sleep(baseDelay * (1 << attempt))
+}
+// После всех retry — коммитим (dead letter)
+reader.CommitMessages(ctx, msg)
+```
+
+**Idempotency:** при at-least-once delivery сообщения могут быть обработаны дважды. Решение:
+- Уникальный event ID + таблица обработанных событий
+- Upsert в БД (INSERT ON CONFLICT UPDATE)
+- Идемпотентные операции (increment OK, но double-counting возможен)
+
+---
+
+## 8. CAP-теорема
+
+### Вопрос: Что такое CAP-теорема и как она влияет на выбор технологий?
+
+**Ответ:**
+
+**CAP-теорема (Brewer's theorem):** распределённая система может гарантировать только 2 из 3 свойств:
+
+- **C (Consistency):** все узлы видят одни и те же данные одновременно
+- **A (Availability):** каждый запрос получает ответ (успех или ошибка)
+- **P (Partition Tolerance):** система работает при потере связи между узлами
+
+**В реальности P обязательна** (сети ненадёжны), поэтому выбор между **CP** и **AP**:
+
+| Система | CAP | Пример |
+|---------|-----|--------|
+| CP | Consistency + Partition Tolerance | PostgreSQL (с репликацией), ZooKeeper |
+| AP | Availability + Partition Tolerance | Cassandra, DynamoDB |
+| CA | Consistency + Availability | Одноузловая БД (не распределённая) |
+
+**В нашем проекте:**
+- **PostgreSQL** — CP (при partition: отказывает в записи, но не возвращает stale данные)
+- **Kafka** — CP (на уровне партиции: leader election при потере лидера)
+- **Redis** — AP (по умолчанию; с Redis Sentinel — ближе к CP)
+
+---
+
+## 9. Saga Pattern
+
+### Вопрос: Как обеспечить консистентность данных между микросервисами?
+
+**Ответ:**
+
+В распределённой системе нет ACID-транзакций. Вместо них — **Saga pattern**.
+
+**Choreography (децентрализованная):**
+
+```
+Link Service: creates link → publishes LinkCreated event
+Stats Service: listens → creates initial stats entry
+Cache Service: listens → pre-warms cache
+```
+
+**Orchestration (централизованная):**
+
+```
+Orchestrator:
+1. Tell Link Service: create link
+2. Tell Stats Service: create stats (if step 1 succeeds)
+3. Tell Cache Service: warm cache (if step 2 succeeds)
+4. If any step fails: compensate (undo previous steps)
+```
+
+**В нашем проекте:** используем простую choreography — при redirect публикуем ClickEvent, Stats Service обрабатывает его. Если Stats Service упал — события ждут в Kafka (retention policy).
+
+**Compensation:** если обработка события провалилась после всех retry — логируем и продолжаем. Статистика может быть неполной, но redirect работает (приоритет).
+
+---
+
+## 10. API Gateway
+
+### Вопрос: Зачем нужен API Gateway?
+
+**Ответ:**
+
+**API Gateway** — единая точка входа, которая:
+
+1. **Маршрутизация:** направляет запросы к нужному сервису
+2. **Аутентификация:** проверяет API key / JWT (один раз, не в каждом сервисе)
+3. **Rate limiting:** ограничение запросов на уровне gateway
+4. **CORS, SSL termination:** cross-cutting concerns
+5. **Load balancing:** round-robin между репликами
+
+**В нашем проекте:**
+
+```go
+// Маршрутизация в gateway
+if strings.HasPrefix(path, "/api/v1/stats/") {
+    statsProxy.ServeHTTP(w, r)  // → Stats Service
+} else {
+    linkProxy.ServeHTTP(w, r)   // → Link Service
+}
+```
+
+**Альтернативы:**
+- **Nginx / Envoy:** production-ready, высокая производительность
+- **Kong / Traefik:** с plugin-экосистемой
+- **Свой gateway:** для обучения (наш вариант)
+
+---
+
+## 11. Graceful Shutdown в микросервисах
+
+### Вопрос: Как правильно остановить микросервис?
+
+**Ответ:**
+
+**Порядок shutdown для Link Service:**
+
+```go
+1. Получаем SIGTERM/SIGINT
+2. server.Shutdown(ctx)           // перестаём принимать запросы
+3. kafkaProducer.Close()          // сбрасываем буфер Kafka
+4. redisClient.Close()            // закрываем Redis
+5. pool.Close()                   // закрываем PostgreSQL
+```
+
+**Порядок shutdown для Stats Service:**
+
+```go
+1. Получаем SIGTERM/SIGINT
+2. server.Shutdown(ctx)           // перестаём принимать запросы
+3. kafkaConsumer.Stop()           // завершаем обработку текущих сообщений
+4. pool.Close()                   // закрываем PostgreSQL
+```
+
+**Ключевой принцип:** сначала перестаём принимать новую работу, потом завершаем текущую, потом закрываем ресурсы.
+
+---
+
+## 12. Формат событий: JSON vs Protobuf
+
+### Вопрос: Какой формат сериализации выбрать для событий?
+
+**Ответ:**
+
+| Критерий | JSON | Protobuf | Avro |
+|----------|------|----------|------|
+| Readability | ✅ Человекочитаемый | ❌ Бинарный | ❌ Бинарный |
+| Размер | ❌ Большой (3-5x) | ✅ Маленький | ✅ Маленький |
+| Скорость | ❌ Медленный | ✅ Быстрый | ✅ Быстрый |
+| Schema | ❌ Нет (runtime) | ✅ .proto файлы | ✅ Schema Registry |
+| Совместимость | ✅ Гибкий | ⚠️ Нужна дисциплина | ✅ Schema evolution |
+| Инструменты | ✅ Везде | ⚠️ Нужен protoc | ⚠️ Schema Registry |
+
+**В нашем проекте:** JSON — для простоты и наглядности.
+
+**В production:** Protobuf (gRPC) или Avro (Kafka + Schema Registry) — для производительности и schema evolution.
+
+---
+
+## 13. Мониторинг микросервисов
+
+### Вопрос: Как мониторить микросервисную архитектуру?
+
+**Ответ:**
+
+**Три столпа observability:**
+
+1. **Logs:** структурированные логи с correlation ID
+2. **Metrics:** Prometheus + Grafana
+3. **Traces:** OpenTelemetry + Jaeger/Zipkin
+
+**Ключевые метрики для нашего проекта:**
+
+| Метрика | Сервис | Описание |
+|---------|--------|----------|
+| `http_requests_total` | Link, Stats | RPS по endpoint |
+| `http_request_duration_seconds` | Link, Stats | Latency p50/p95/p99 |
+| `kafka_consumer_lag` | Stats | Отставание consumer от producer |
+| `kafka_producer_errors` | Link | Ошибки публикации |
+| `cache_hit_ratio` | Link | Эффективность кэша |
+
+**Correlation ID:** при входе в систему генерируем уникальный ID, передаём его через все сервисы (через заголовки HTTP и Kafka metadata). Позволяет отследить цепочку запросов.
+
+---
+
+## 14. Что могут спросить на собеседовании
+
+### Типичные вопросы:
+
+**Q1: Какая гарантия доставки сообщений в Kafka?**
+
+A: По умолчанию — **at-least-once** (сообщение может быть доставлено несколько раз). **At-most-once** достигается auto-commit (возможны потери). **Exactly-once** — через transactions (Kafka 0.11+) или идемпотентные consumers.
+
+**Q2: Что будет, если Stats Service упадёт на час?**
+
+A: Ничего критичного. Kafka хранит сообщения (retention policy — по умолчанию 7 дней). Когда Stats Service восстановится, consumer начнёт с последнего закоммиченного offset и обработает все накопленные события. Redirect при этом продолжает работать.
+
+**Q3: Как масштабировать consumer?**
+
+A: Добавляем partitions в topic и consumers в consumer group. Каждый consumer обрабатывает одну или несколько partitions. Kafka автоматически балансирует partitions между consumers (rebalance).
+
+**Q4: Что такое consumer lag и как его мониторить?**
+
+A: Consumer lag — разница между последним offset в partition и последним закоммиченным offset consumer. Большой lag = consumer не успевает обрабатывать. Мониторим через `kafka-consumer-groups.sh` или Kafka Exporter для Prometheus.
+
+**Q5: Почему не gRPC между сервисами?**
+
+A: Для асинхронной коммуникации (клик → статистика) gRPC не подходит — он синхронный. Kafka даёт decoupling, buffering и replay. Для синхронных запросов (GetStats) можно добавить gRPC как оптимизацию, но REST проще для учебного проекта.
+
+**Q6: Как обеспечить идемпотентность при at-least-once?**
+
+A: Варианты:
+1. Deduplication table: сохраняем event_id, проверяем перед обработкой
+2. Upsert: `INSERT ON CONFLICT DO UPDATE` (идемпотентная запись)
+3. Increment неидемпотентен → считаем уникальные events по ID
+
+---
+
+## Ключевые темы для собеседования
+
+1. **Monolith vs Microservices** — когда переход оправдан, минусы
+2. **Kafka** — producers, consumers, topics, partitions, offsets, consumer groups
+3. **Event-Driven Architecture** — decoupling, eventual consistency, CQRS
+4. **CAP-теорема** — CP vs AP, влияние на выбор БД
+5. **Saga pattern** — распределённые транзакции, choreography vs orchestration
+6. **API Gateway** — маршрутизация, cross-cutting concerns
+7. **Graceful shutdown** — порядок завершения компонентов
+8. **JSON vs Protobuf** — tradeoffs для сериализации событий
+9. **Observability** — logs, metrics, traces, correlation ID
+10. **At-least-once delivery** — idempotency, deduplication
+
+---
+
+## Следующий этап
+
+После изучения этих вопросов переходим к **Этапу 6: Оптимизация (алгоритмы)** — HyperLogLog, Bloom Filter, Sorted Sets.

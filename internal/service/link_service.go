@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/UZver24/URL-Shortener/internal/handler/middleware"
+	kafkapkg "github.com/UZver24/URL-Shortener/internal/messaging/kafka"
 	"github.com/UZver24/URL-Shortener/internal/model"
 	"github.com/UZver24/URL-Shortener/internal/worker"
 )
@@ -31,22 +32,55 @@ type LinkCache interface {
 	Delete(ctx context.Context, shortCode string) error
 }
 
+// ClickPublisher — интерфейс для публикации событий кликов (Kafka или воркер-пул)
+type ClickPublisher interface {
+	Publish(ctx context.Context, event *kafkapkg.ClickEvent) error
+}
+
+// KafkaClickPublisher адаптирует kafka.Producer к ClickPublisher
+type KafkaClickPublisher struct {
+	producer *kafkapkg.Producer
+}
+
+func NewKafkaClickPublisher(p *kafkapkg.Producer) *KafkaClickPublisher {
+	return &KafkaClickPublisher{producer: p}
+}
+
+func (k *KafkaClickPublisher) Publish(ctx context.Context, event *kafkapkg.ClickEvent) error {
+	return k.producer.PublishClick(ctx, event)
+}
+
+// WorkerPoolClickPublisher адаптирует воркер-пул к ClickPublisher (для обратной совместимости)
+type WorkerPoolClickPublisher struct {
+	repo LinkRepository
+	pool *worker.WorkerPool
+}
+
+func NewWorkerPoolClickPublisher(repo LinkRepository, pool *worker.WorkerPool) *WorkerPoolClickPublisher {
+	return &WorkerPoolClickPublisher{repo: repo, pool: pool}
+}
+
+func (w *WorkerPoolClickPublisher) Publish(ctx context.Context, event *kafkapkg.ClickEvent) error {
+	task := worker.NewTask(event.LinkID, event.ShortCode)
+	return w.pool.Submit(task)
+}
+
 // LinkService реализует бизнес-логику для работы со ссылками
 type LinkService struct {
-	repo   LinkRepository
-	cache  LinkCache          // опциональный кэш (может быть nil)
-	pool   *worker.WorkerPool // опциональный воркер-пул (может быть nil)
-	logger *slog.Logger
+	repo      LinkRepository
+	cache     LinkCache          // опциональный кэш (может быть nil)
+	publisher ClickPublisher     // опциональный publisher (Kafka или воркер-пул, может быть nil)
+	logger    *slog.Logger
 }
 
 // NewLinkService создаёт новый сервис
-// cache и pool могут быть nil — тогда работаем без кэша/воркер-пула
-func NewLinkService(repo LinkRepository, logger *slog.Logger, cache LinkCache, pool *worker.WorkerPool) *LinkService {
+// cache и publisher могут быть nil — тогда работаем без кэша/publisher
+func NewLinkService(repo LinkRepository, logger *slog.Logger, cache LinkCache, publisher ClickPublisher) *LinkService {
 	return &LinkService{
-		repo:   repo,
-		cache:  cache,
-		pool:   pool,
-		logger: logger,
+		repo:      repo,
+		cache:     cache,
+		publisher: publisher,
+		logger:    logger,
 	}
 }
 
@@ -126,7 +160,7 @@ func (s *LinkService) CreateLink(ctx context.Context, originalURL string, custom
 
 // GetOriginalURL возвращает оригинальный URL по короткому коду и увеличивает счётчик
 // Реализует cache-aside паттерн: сначала проверяем кэш, потом БД
-func (s *LinkService) GetOriginalURL(ctx context.Context, code string) (string, error) {
+func (s *LinkService) GetOriginalURL(ctx context.Context, code string, userAgent string, referer string) (string, error) {
 	var link *model.Link
 	var err error
 
@@ -137,8 +171,8 @@ func (s *LinkService) GetOriginalURL(ctx context.Context, code string) (string, 
 			// Cache hit — используем данные из кэша
 			s.logger.Debug("cache hit", "short_code", code)
 			middleware.RecordCacheHit("get")
-			// Асинхронно увеличиваем счётчик через воркер-пул
-			s.incrementClicksAsync(link.ID, link.ShortCode)
+			// Публикуем событие клика (Kafka или воркер-пул)
+			s.publishClickAsync(link.ID, link.ShortCode, userAgent, referer)
 			return link.OriginalURL, nil
 		}
 		// Cache miss или ошибка — продолжаем с БД
@@ -167,42 +201,31 @@ func (s *LinkService) GetOriginalURL(ctx context.Context, code string) (string, 
 		}
 	}
 
-	// 4. Асинхронно увеличиваем счётчик через воркер-пул
-	s.incrementClicksAsync(link.ID, link.ShortCode)
+	// 4. Публикуем событие клика (Kafka или воркер-пул)
+	s.publishClickAsync(link.ID, link.ShortCode, userAgent, referer)
 
 	return link.OriginalURL, nil
 }
 
-// incrementClicksAsync увеличивает счётчик переходов через воркер-пул
-// Если pool недоступен — fallback к простому goroutine (для совместимости)
-func (s *LinkService) incrementClicksAsync(linkID int64, shortCode string) {
-	if s.pool != nil {
-		task := worker.NewTask(linkID, shortCode)
-		if err := s.pool.Submit(task); err != nil {
-			s.logger.Warn("failed to submit task to worker pool",
+// publishClickAsync публикует событие клика асинхронно
+func (s *LinkService) publishClickAsync(linkID int64, shortCode, userAgent, referer string) {
+	if s.publisher == nil {
+		return // Нет publisher — пропускаем
+	}
+
+	event := kafkapkg.NewClickEvent(linkID, shortCode, userAgent, referer)
+
+	// Публикуем в фоне, чтобы не блокировать redirect
+	go func() {
+		bgCtx := context.Background()
+		if err := s.publisher.Publish(bgCtx, event); err != nil {
+			s.logger.Error("failed to publish click event",
 				"link_id", linkID,
 				"short_code", shortCode,
 				"error", err,
 			)
-			// Fallback: синхронный increment в фоне
-			go s.syncIncrementClicks(linkID)
 		}
-		return
-	}
-
-	// Fallback: без воркер-пула (для тестов или graceful degradation)
-	go s.syncIncrementClicks(linkID)
-}
-
-// syncIncrementClicks — синхронное увеличение счётчика (fallback)
-func (s *LinkService) syncIncrementClicks(linkID int64) {
-	bgCtx := context.Background()
-	if err := s.repo.IncrementClicks(bgCtx, linkID); err != nil {
-		s.logger.Error("failed to increment clicks",
-			"link_id", linkID,
-			"error", err,
-		)
-	}
+	}()
 }
 
 // GetStats возвращает статистику по ссылке

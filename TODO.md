@@ -1,379 +1,346 @@
-# TODO — Фаза II: Кэширование
+# TODO — Фаза III: Микросервисы и Оптимизация
 
-> **Архитектура фазы II:**
+> **Текущая архитектура (Фаза II — завершена, тег `phase-ii-cache`):**
 > ```
 > Client → HTTP API (Go) → Redis (кэш) → PostgreSQL
+>              ↓
+>         Worker Pool (асинхронное обновление счётчика)
 > ```
 
+**Выполнено:**
+- Этап 0. Подготовка ✅
+- Этап 1. MVP — базовый CRUD ✅ (тег `v1.0.0-monolith`)
+- Этап 2. Улучшения ✅
+- Этап 3. Кэш (Redis) ✅
+- Этап 4. Конкурентность ✅
+
 ---
 
-## Этап 3. Кэш (Redis) ✅ ВЫПОЛНЕН
+## Этап 5. Микросервисы ✅
 
-### Как запустить с Redis
-
-```bash
-# Вариант 1: Всё через Docker Compose (PostgreSQL + Redis + API)
-docker-compose up --build
-
-# Вариант 2: Только PostgreSQL и Redis в Docker, приложение локально
-docker-compose up -d postgres redis
-go run ./cmd/api
-
-# Проверка работы
-curl http://localhost:8080/health
-# Ожидаемый ответ: {"status":"ok","database":"ok","cache":"ok"}
-
-# Проверка метрик кэша
-curl http://localhost:8080/metrics | grep cache_
-# cache_hits_total{operation="get"} 0
-# cache_misses_total{operation="get"} 0
-# cache_errors_total{operation="get"} 0
-
-# Тестирование
-go test -v ./...
-go test -coverprofile=coverage.out ./...
-go tool cover -func=coverage.out
-```
+> **Цель:** Разделить монолит на Link Service (CRUD + redirect) и Stats Service (аналитика). Научиться работать с message broker для асинхронной коммуникации.
 
 ### Задачи
+
+- [x] **Архитектурный анализ**
+  - [x] Определить границы сервисов:
+    - **Link Service:** `POST /api/v1/links`, `GET /{short}`, `DELETE /api/v1/links/{short}`
+    - **Stats Service:** `GET /api/v1/links/{short}/stats`, `GET /api/v1/stats/top`, `GET /api/v1/stats/trending`
+  - [x] Выбрать стратегию коммуникации:
+    - **Асинхронная (Kafka):** для `IncrementClicks()` (не блокирует redirect)
+  - [x] Определить формат событий (JSON — для простоты и наглядности)
 
 - [x] **Подготовка инфраструктуры**
-  - [x] Добавить Redis в `docker-compose.yml`
-    ```yaml
-    redis:
-      image: redis:7-alpine
-      container_name: url-shortener-redis
-      ports:
-        - "6379:6379"
-      volumes:
-        - redis_data:/data
-      healthcheck:
-        test: ["CMD", "redis-cli", "ping"]
-        interval: 10s
-        timeout: 5s
-        retries: 5
-    ```
-  - [x] Добавить `redis_data` volume в docker-compose
-  - [x] Проверить подключение: `redis-cli ping` → `PONG`
+  - [x] Добавить Kafka (KRaft mode, без Zookeeper) в `docker-compose.yml`
+  - [x] Настроить `docker-compose` для запуска трёх сервисов: `link-service`, `stats-service`, `gateway`
+  - [x] Обновить `.env.example` для каждого сервиса
 
-- [x] **Интеграция Redis клиента**
-  - [x] Установить библиотеку: `go get github.com/redis/go-redis/v9`
-  - [x] Создать `internal/repository/redis/redis.go`:
-    - [x] Подключение к Redis через `redis.NewClient()`
-    - [x] Конфигурация через переменные окружения (`REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`)
-    - [x] Ping для проверки соединения при старте
-  - [x] Graceful shutdown: закрытие соединения с Redis
+- [x] **Выделение Stats Service**
+  - [x] Создать `cmd/stats-service/main.go` (отдельная точка входа)
+  - [x] Перенести логику:
+    - Обработка событий из Kafka (consumer)
+    - `GetStats()` — получение статистики
+    - `GetTopLinks()` — топ популярных ссылок
+    - `GetTrending()` — "горячие" ссылки
+  - [x] Создать отдельную схему в БД для статистики
+  - [x] Миграции для таблиц `click_events` и `link_stats`
 
-- [x] **Реализация кэш-слоя**
-  - [x] Создать `internal/repository/redis/link_cache.go`:
-    - [x] `Get(ctx, shortCode) (*model.Link, error)` — получить ссылку из кэша
-    - [x] `Set(ctx, shortCode, *model.Link, ttl) error` — сохранить ссылку в кэш
-    - [x] `Delete(ctx, shortCode) error` — удалить ссылку из кэша (инвалидация)
-  - [x] Формат хранения: JSON (сериализация `*model.Link`)
-  - [x] TTL по умолчанию: 1 час (настраиваемый через `REDIS_TTL`)
+- [x] **Интеграция с Kafka**
+  - [x] Установить библиотеку: `github.com/segmentio/kafka-go`
+  - [x] Создать `internal/messaging/kafka/`:
+    - `producer.go` — публикация событий (`PublishClick()`)
+    - `consumer.go` — потребление событий с retry и exponential backoff
+    - `events.go` — определение структуры события `ClickEvent`
+  - [x] Graceful shutdown producer/consumer
 
-- [x] **Cache-aside паттерн в сервисном слое**
-  - [x] Обновить `internal/service/link_service.go`:
-    - [x] `GetOriginalURL()`:
-      1. Проверить Redis (`cache.Get()`)
-      2. Если есть → вернуть из кэша (cache hit)
-      3. Если нет → получить из PostgreSQL (`repo.GetByCode()`)
-      4. Сохранить в Redis (`cache.Set()` с TTL)
-      5. Вернуть результат
-    - [x] `GetStats()`:
-      1. Проверить Redis
-      2. Если нет → получить из PostgreSQL
-      3. Сохранить в Redis
-    - [x] `Create()`:
-      1. Создать в PostgreSQL
-      2. **Не сохранять в кэш** (ленивое кэширование)
-    - [x] `Delete()`:
-      1. Удалить из PostgreSQL
-      2. Инвалидировать кэш (`cache.Delete()`)
+- [x] **Обновление Link Service**
+  - [x] При redirect → публиковать событие `ClickEvent` в Kafka
+  - [x] Создать интерфейс `ClickPublisher` для абстракции от Kafka/воркер-пула
+  - [x] Монолит (`cmd/api`) продолжает работать через `WorkerPoolClickPublisher` (обратная совместимость)
 
-- [x] **Graceful degradation**
-  - [x] Если Redis недоступен:
-    - [x] Работать напрямую с PostgreSQL (fallback)
-    - [x] Логировать ошибку Redis (WARN уровень)
-    - [x] Не прерывать работу приложения
-  - [x] Добавить метрику: `cache_errors_total` (Counter)
-
-- [x] **Метрики для кэша**
-  - [x] Добавить метрики в `internal/handler/middleware/metrics.go`:
-    - [x] `cache_hits_total` (Counter) — количество попаданий в кэш
-    - [x] `cache_misses_total` (Counter) — количество промахов
-    - [x] `cache_errors_total` (Counter) — количество ошибок
-  - [x] Метки: `operation` (get/set/delete)
-  - [x] Обновить `/metrics` endpoint
-
-- [x] **Обновление health-check**
-  - [x] Обновить `internal/handler/health_handler.go`:
-    - [x] Проверять соединение с Redis (`redis.Ping()`)
-    - [x] Response: `{"status": "ok", "database": "ok", "cache": "ok"}`
-    - [x] Если Redis недоступен: `{"status": "ok", "database": "ok", "cache": "error"}`
-    - [x] HTTP 200 (приложение работает) даже если Redis недоступен
-
-- [x] **Конфигурация**
-  - [x] Добавить переменные окружения в `.env.example`:
-    ```bash
-    REDIS_HOST=localhost
-    REDIS_PORT=6379
-    REDIS_PASSWORD=
-    REDIS_DB=0
-    REDIS_TTL=3600  # 1 час в секундах
-    ```
-  - [x] Обновить `internal/config/config.go` для загрузки Redis конфигурации
+- [x] **API Gateway**
+  - [x] Создать `cmd/gateway/` для единой точки входа
+  - [x] Reverse proxy на Link/Stats Service
+  - [x] Health-check gateway
 
 - [x] **Тестирование**
-  - [x] Unit-тесты для `link_cache.go` (с miniredis)
-  - [x] Unit-тесты для cache-aside паттерна в `link_service_test.go`:
-    - [x] Тест cache hit (получение из кэша)
-    - [x] Тест cache miss (получение из БД + сохранение в кэш)
-    - [x] Тест инвалидации кэша при удалении
-    - [x] Тест graceful degradation (ошибка кэша → fallback к БД)
-  - [ ] Integration-тесты:
-    - [ ] Поднять Redis в тестовом docker-compose
-    - [ ] Тест cache-aside паттерна (hit/miss)
-    - [ ] Тест инвалидации кэша при удалении
-    - [ ] Тест graceful degradation (остановить Redis, проверить fallback)
-  - [ ] Нагрузочное тестирование:
-    - [ ] Сравнить latency с кэшем и без
-    - [ ] Измерить hit ratio при реалистичной нагрузке
+  - [x] Unit-тесты для events (сериализация/десериализация)
+  - [x] Обновлены тесты service и handler
 
-- [x] **Собеседование по Этапу 3:**
-  - [x] Что такое кэширование? Зачем нужно?
-  - [x] Cache-aside vs Write-through vs Write-back — различия, плюсы/минусы
-  - [x] TTL и стратегии вытеснения (LRU, LFU, FIFO)
-  - [x] Инвалидация кэша: почему это сложно? Паттерны инвалидации
-  - [x] Redis vs Memcached: когда что использовать?
-  - [x] Как измерять эффективность кэша (hit ratio)?
-  - [x] Что такое graceful degradation? Зачем нужно?
-  - [x] Подробности — в `INTERVIEW.md`
+- [x] **Документация и собеседование**
+  - [x] Обновить `README.md`: архитектура микросервисов
+  - [x] Обновить `AGENTS.md`: новая структура проекта
+  - [x] Добавить блок в `INTERVIEW.md`:
+    - Monolith vs Microservices: плюсы/минусы
+    - Синхронная (REST/gRPC) vs асинхронная (Kafka) коммуникация
+    - Event-driven архитектура
+    - Kafka: producers, consumers, topics, partitions, offsets
+    - Saga pattern для распределённых транзакций
+    - CAP-теорема и её влияние на выбор БД
+    - API Gateway
+    - Graceful shutdown в микросервисах
+    - JSON vs Protobuf
+    - Мониторинг микросервисов
 
-### Результаты Этапа 3
+### Результаты (достигнутые)
 
-**Покрытие тестами:**
-- `service`: 81.7% (было 62.7%) ✅
-- `repository/redis`: 51.7% (85% на Get/Set/Delete) ✅
-- `handler`: 52.9%
+**Новая архитектура:**
+```
+Client → Gateway (:8080) → Link Service (:8081) → PostgreSQL (links) → Redis (кэш)
+                         ↘
+                          Kafka (link.clicks)
+                              ↓
+                          Stats Service (:8082) → PostgreSQL (stats + click_events)
+```
 
-**Добавленные файлы:**
-- `internal/repository/redis/redis.go` — клиент Redis
-- `internal/repository/redis/link_cache.go` — кэш-слой
-- `internal/repository/redis/link_cache_test.go` — unit-тесты кэша
-
-**Изменённые файлы:**
-- `internal/service/link_service.go` — cache-aside паттерн
-- `internal/service/link_service_test.go` — тесты cache-aside + mockCache
-- `internal/handler/health_handler.go` — проверка Redis
-- `internal/handler/middleware/metrics.go` — метрики кэша
-- `internal/config/config.go` — Redis конфигурация
-- `cmd/api/main.go` — wire Redis + graceful degradation
-- `docker-compose.yml` — сервис Redis
-- `.env.example` / `.env` — Redis переменные
-
-**Зависимости:**
-- `github.com/redis/go-redis/v9` — Redis клиент
-- `github.com/alicebob/miniredis/v2` — для unit-тестов
+**Ключевые фичи:**
+- ✅ Независимое масштабирование сервисов
+- ✅ Изоляция сбоев (падение Stats не влияет на redirect)
+- ✅ Асинхронная обработка статистики через Kafka
+- ✅ Готовность к горизонтальному масштабированию
+- ✅ Обратная совместимость: монолит (`cmd/api`) продолжает работать
+- ✅ Graceful shutdown для всех компонентов
+- ✅ Exponential backoff при ошибках обработки событий
 
 ---
 
-## Этап 4. Конкурентность ✅ ВЫПОЛНЕН
+## Этап 6. Оптимизация (алгоритмы)
 
-### Как запустить
-
-```bash
-# Вариант 1: Всё через Docker Compose (PostgreSQL + Redis + API)
-docker-compose up --build
-
-# Вариант 2: Только PostgreSQL и Redis в Docker, приложение локально
-docker-compose up -d postgres redis
-go run ./cmd/api
-
-# Проверка работы
-curl http://localhost:8080/health
-# Ожидаемый ответ: {"status":"ok","database":"ok","cache":"ok"}
-
-# Проверка метрик воркер-пула
-curl http://localhost:8080/metrics | grep worker_
-# worker_queue_size 0
-# worker_tasks_processed_total{status="success"} 0
-# worker_tasks_processed_total{status="error"} 0
-# worker_errors_total 0
-
-# Тестирование
-go test -v ./...
-go test -coverprofile=coverage.out ./...
-go tool cover -func=coverage.out
-```
+> **Цель:** Применить алгоритмы и структуры данных для оптимизации. Оценить сложность решений в Big O. Использовать встроенные возможности Redis (HyperLogLog, Sorted Sets).
 
 ### Задачи
 
-- [x] **Анализ текущей реализации**
-  - [x] Изучить текущий `IncrementClicks()` в `link_service.go`
-  - [x] Проблема: синхронное обновление счётчика увеличивает latency
-  - [x] Решение: асинхронная запись через канал + воркер-пул
+- [ ] **Генерация коротких кодов**
+  - [ ] Текущая реализация: случайная строка base62 (6 символов, crypto/rand)
+  - [ ] Сравнить с альтернативами:
+    - **Base62 от ID (автоинкремент):** детерминированно, нет коллизий, но предсказуемо
+    - **Snowflake ID (Twitter):** распределённая генерация, 64-bit, O(1)
+    - **Counter + Base62 + obfuscation:** детерминированно + непредсказуемо
+  - [ ] Реализовать и бенчмаркнуть каждый вариант
+  - [ ] Оценка сложности: O(1) vs O(n) при коллизиях
 
-- [x] **Реализация воркер-пула**
-  - [x] Создать `internal/worker/pool.go`:
-    - [x] Структура `WorkerPool`:
-      ```go
-      type WorkerPool struct {
-          tasks      chan Task
-          handler    TaskHandler
-          workers    int
-          wg         sync.WaitGroup
-          quit       chan struct{}
-          maxRetries int
-          baseDelay  time.Duration
-      }
-      ```
-    - [x] `NewWorkerPool(cfg)` — создание пула
-    - [x] `Start()` — запуск воркеров
-    - [x] `Submit(task Task) error` — добавление задачи в очередь
-    - [x] `Stop()` — graceful shutdown (дождаться обработки всех задач)
-  - [x] Количество воркеров: настраиваемое через `WORKER_COUNT` (по умолчанию: 5)
-  - [x] Размер буфера: настраиваемое через `WORKER_BUFFER_SIZE` (по умолчанию: 1000)
-
-- [x] **Определение задачи**
-  - [x] Создать `internal/worker/task.go`:
-    ```go
-    type Task struct {
-        LinkID    int64
-        ShortCode string
-        Timestamp time.Time
-    }
+- [ ] **Уникальные переходы (HyperLogLog)**
+  - [ ] Проблема: `COUNT(DISTINCT user_id)` → O(n), много памяти
+  - [ ] Решение: HyperLogLog на Redis:
+    ```bash
+    PFADD link:unique:{id} {user_id}
+    PFCOUNT link:unique:{id}
     ```
-  - [x] Воркер:
-    1. Читает задачу из канала `tasks`
-    2. Вызывает handler с exponential backoff
-    3. Логирует ошибки
-    4. Записывает метрики (success/error, duration)
-    5. Переходит к следующей задаче
+    - Точность: ~0.81% ошибки при 1KB памяти
+    - **Сложность:** O(1) добавление, O(1) получение
+  - [ ] Интеграция в Stats Service:
+    - При клике → `PFADD` в Redis
+    - При статистике → `PFCOUNT` (можно объединять для диапазона дат)
+  - [ ] Добавить поле `unique_clicks` в API статистики
 
-- [x] **Интеграция в сервисный слой**
-  - [x] Обновить `internal/service/link_service.go`:
-    - [x] `GetOriginalURL()`:
-      1. Получить ссылку из кэша/PostgreSQL
-      2. Отправить задачу в воркер-пул: `pool.Submit(Task{LinkID: id})`
-      3. Вернуть URL (не дожидаясь обновления счётчика)
-    - [x] Graceful shutdown:
-      1. Закрыть HTTP-сервер
-      2. Остановить воркер-пул (`pool.Stop()`)
-      3. Дождаться обработки всех задач
-      4. Закрыть соединения с PostgreSQL и Redis
-
-- [x] **Graceful shutdown**
-  - [x] Обновить `cmd/api/main.go`:
-    - [x] Создать воркер-пул при старте
-    - [x] Передать пул в `link_service`
-    - [x] При получении SIGTERM:
-      1. Остановить HTTP-сервер (`server.Shutdown()`)
-      2. Остановить воркер-пул (`pool.Stop()`)
-      3. Закрыть PostgreSQL (`pool.Close()`)
-      4. Закрыть Redis (`redis.Close()`)
-  - [x] Таймаут: 30 секунд (настраиваемый через `SHUTDOWN_TIMEOUT`)
-
-- [x] **Обработка ошибок**
-  - [x] Если PostgreSQL недоступен:
-    - [x] Повторить попытку через exponential backoff (1s, 2s, 4s, 8s, 16s)
-    - [x] Максимум 5 попыток
-    - [x] Если все попытки провалились → логировать ошибку (ERROR)
-  - [x] Метрика: `worker_errors_total` (Counter)
-
-- [x] **Метрики для воркер-пула**
-  - [x] Добавить метрики в `internal/handler/middleware/metrics.go`:
-    - [x] `worker_queue_size` (Gauge) — текущий размер очереди
-    - [x] `worker_tasks_processed_total` (Counter) — обработано задач
-    - [x] `worker_processing_duration_seconds` (Histogram) — время обработки задачи
-  - [x] Метки: `status` (success/error)
-
-- [ ] **Batch-обновления (опционально)**
-  - [ ] Накопить N задач (например, 100) или ждать T секунд (например, 5)
-  - [ ] Выполнить batch UPDATE:
-    ```sql
-    UPDATE links
-    SET clicks = clicks + batch.count
-    FROM (VALUES ('abc123', 5), ('xyz789', 3)) AS batch(short_code, count)
-    WHERE links.short_code = batch.short_code
+- [ ] **Топ популярных ссылок (Sorted Set)**
+  - [ ] Проблема: `ORDER BY clicks DESC LIMIT 10` → O(n log n)
+  - [ ] Решение: Redis Sorted Set:
+    ```bash
+    ZINCRBY link:popularity 1 {link_id}
+    ZREVRANGE link:popularity 0 9 WITHSCORES
     ```
-  - [ ] Преимущества: снижение нагрузки на PostgreSQL
+    - **Сложность:** O(log n) обновление, O(k + log n) получение топ-k
+  - [ ] Реализовать `GET /api/v1/stats/top?limit=10`
+  - [ ] Альтернатива: Count-Min Sketch для частотного анализа
 
-- [x] **Тестирование**
-  - [x] Unit-тесты для `worker/pool.go`:
-    - [x] Тест graceful shutdown (все задачи обработаны)
-    - [x] Тест переполнения буфера (ошибка при `Submit()`)
-    - [x] Тест обработки ошибок в воркерах
-    - [x] Тест exponential backoff
-    - [x] Тест параллельной обработки
-  - [x] Integration-тесты:
-    - [x] Создать ссылку
-    - [x] Сделать 5 переходов
-    - [x] Проверить, что счётчик = 5 (после обработки всех задач)
-  - [ ] Нагрузочное тестирование:
-    - [ ] Измерить latency `GetOriginalURL()` (должна уменьшиться)
-    - [ ] Проверить, что все задачи обработаны при shutdown
+- [ ] **"Горячие" ссылки (Trending)**
+  - [ ] Проблема: найти ссылки с всплеском активности за последний час
+  - [ ] Решение: Sliding Window на Redis:
+    ```bash
+    # Окно 60 минут, гранулярность 1 минута
+    INCR link:window:{id}:{minute}
+    EXPIRE link:window:{id}:{minute} 3600
+    # Сумма за окно:
+    MGET link:window:{id}:{minute-1} ... link:window:{id}:{minute-60}
+    ```
+  - [ ] Реализовать `GET /api/v1/stats/trending`
+  - [ ] Альтернатива: Redis TimeSeries (для более сложной аналитики)
 
-- [x] **Собеседование по Этапу 4:**
-  - [x] Что такое конкурентность в Go? Goroutines vs threads
-  - [x] Каналы: буферизированные vs небуферизированные
-  - [x] Паттерн Worker Pool: зачем нужен, как реализовать?
-  - [x] `sync.WaitGroup`: для чего используется?
-  - [x] Graceful shutdown: как правильно остановить воркеры?
-  - [x] Exponential backoff: что это, зачем нужно?
-  - [x] Batch-обработки: преимущества, как реализовать?
-  - [x] Подробности — в `INTERVIEW.md`
+- [ ] **Bloom Filter (опционально)**
+  - [ ] Проблема: как быстро проверить, существует ли short_code?
+  - [ ] Решение: Bloom Filter перед БД:
+    - `false` → кода точно нет (не идти в БД)
+    - `true` → возможно есть (идти в БД)
+  - [ ] Реализация: Redis `BF.ADD`, `BF.EXISTS` (RedisBloom модуль)
+  - [ ] Применение: защита от DoS-атак с несуществующими кодами
 
-### Результаты Этапа 4
+- [ ] **Нагрузочное тестирование**
+  - [ ] Инструменты: `wrk`, `hey`, `vegeta`
+  - [ ] Сценарии:
+    - 10000 RPS на `GET /{short}` (redirect)
+    - 1000 RPS на `POST /api/v1/links` (создание)
+    - 100 RPS на `GET /api/v1/stats/top`
+  - [ ] Измерить:
+    - Latency (p50, p95, p99)
+    - Throughput (RPS)
+    - Memory usage (Redis, PostgreSQL)
+  - [ ] Сравнить "до" и "после" оптимизаций
 
-**Покрытие тестами:**
-- `worker`: 96.3% ✅
-- `service`: 83.0% (было 81.7%) ✅
-- `handler`: 52.9%
-- `repository/redis`: 51.7%
+- [ ] **Документация и собеседование**
+  - [ ] Добавить блок в `INTERVIEW.md`:
+    - Base62 vs UUID vs Snowflake: когда что?
+    - HyperLogLog: принцип работы, точность, применение
+    - Probabilistic data structures: Count-Min Sketch, Bloom Filter
+    - Big O notation: как оценить алгоритм
+    - Premature optimization: когда оптимизировать, а когда нет
 
-**Добавленные файлы:**
-- `internal/worker/task.go` — определение задачи
-- `internal/worker/pool.go` — WorkerPool с exponential backoff
-- `internal/worker/pool_test.go` — unit-тесты воркер-пула
+### Результаты (ожидаемые)
 
-**Изменённые файлы:**
-- `internal/service/link_service.go` — интеграция с pool
-- `internal/service/link_service_test.go` — тесты интеграции с pool
-- `internal/handler/middleware/metrics.go` — метрики воркера
-- `internal/config/config.go` — WorkerCount, WorkerBufferSize
-- `cmd/api/main.go` — создание пула + правильный graceful shutdown
-- `.env.example` / `.env` — WORKER_COUNT, WORKER_BUFFER_SIZE
-
-**Ключевые фичи:**
-- Exponential backoff (1s → 2s → 4s → 8s → 16s, максимум 5 попыток)
-- Graceful shutdown (все задачи обрабатываются перед завершением)
-- Fallback при переполнении буфера (ErrQueueFull)
-- Метрики: queue_size, processed_total, errors_total, duration
+**Улучшения:**
+- Уникальные переходы: O(n) → O(1), GB → KB памяти
+- Топ ссылок: O(n log n) → O(k + log n)
+- Генерация кодов: защита от коллизий + детерминизм
+- Защита от DoS: Bloom Filter перед БД
 
 ---
 
-## Чеклист готовности Фазы II
+## Этап 7. Production-ready
 
-- [x] Redis добавлен в `docker-compose.yml`
-- [x] Кэш-слой реализован (`internal/repository/redis/link_cache.go`)
-- [x] Cache-aside паттерн интегрирован в сервисный слой
-- [x] Graceful degradation при недоступности Redis
-- [x] Метрики для кэша (hits, misses, hit ratio)
-- [x] Health-check обновлён (проверка Redis)
-- [x] Воркер-пул реализован (`internal/worker/pool.go`)
-- [x] Асинхронное обновление счётчика через воркер-пул
-- [x] Graceful shutdown для воркер-пула
-- [x] Метрики для воркер-пула (queue size, processed, errors)
-- [x] Тесты для кэш-слоя (unit + integration)
-- [x] Тесты для воркер-пула (unit + integration)
-- [x] INTERVIEW.md обновлён (Этап 3)
-- [x] INTERVIEW.md обновлён (Этап 4)
-- [x] README.md обновлён (инструкция по запуску с Redis)
+> **Цель:** Подготовить систему к production-использованию. Безопасность, наблюдаемость, CI/CD.
+
+### Задачи
+
+- [ ] **Аутентификация и авторизация**
+  - [ ] Выбрать стратегию:
+    - **API Keys:** просто, для server-to-server (рекомендуется для начала)
+    - **JWT:** для user-facing приложений
+    - **OAuth2/OIDC:** для интеграции с внешними провайдерами
+  - [ ] Реализация API Keys:
+    - Таблица `api_keys` (key_hash, user_id, scopes, created_at, expires_at)
+    - Middleware для проверки заголовка `Authorization: Bearer <key>`
+    - Кэширование валидных ключей в Redis
+  - [ ] RBAC (Role-Based Access Control):
+    - Скоупы: `links:create`, `links:delete`, `stats:read`
+    - Проверка прав в middleware
+
+- [ ] **Rate Limiting на Redis**
+  - [ ] Использовать уже подключённый Redis (из Фазы II)
+  - [ ] Алгоритм: **Token Bucket** (гибкий, допускает bursts)
+    ```lua
+    -- Lua script для атомарности (выполняется на стороне Redis)
+    local tokens = redis.call('GET', key)
+    -- ... логика пополнения и списания
+    ```
+  - [ ] Реализовать `internal/handler/middleware/ratelimit.go`:
+    - Скользящее окно / token bucket
+    - Лимиты по IP и API Key (раздельно)
+    - Заголовки ответа: `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`
+  - [ ] HTTP 429 Too Many Requests при превышении
+  - [ ] Конфигурация: `RATE_LIMIT_PER_IP`, `RATE_LIMIT_PER_KEY`
+
+- [ ] **Наблюдаемость (Observability)**
+  - [ ] **Логирование:**
+    - Структурированные логи (JSON) — уже есть через `slog`
+    - Request ID — уже есть
+    - Добавить: correlation ID для микросервисов
+  - [ ] **Метрики (уже частично есть):**
+    - Prometheus — интегрирован
+    - Добавить Grafana дашборды:
+      - HTTP requests (RPS, latency p95/p99, error rate)
+      - Cache hit ratio
+      - Worker pool (queue size, processing time)
+      - Kafka consumer lag (после Этапа 5)
+    - Алерты: high error rate, high latency, queue overflow
+  - [ ] **Distributed Tracing:**
+    - OpenTelemetry SDK для Go
+    - Jaeger для визуализации
+    - Трассировка: HTTP → Service → Cache → DB → Kafka
+
+- [ ] **CI/CD Pipeline (GitHub Actions)**
+  - [ ] `.github/workflows/ci.yml`:
+    ```yaml
+    on: [push, pull_request]
+    jobs:
+      test:
+        steps:
+          - go test -race -v ./...
+          - go vet ./...
+          - gofmt -l .
+          - golangci-lint run
+          - go test -coverprofile=coverage.out ./...
+      build:
+        needs: test
+        steps:
+          - docker build -t url-shortener .
+          - docker push
+    ```
+  - [ ] Quality gates:
+    - `golangci-lint` (все линтеры)
+    - `go test -race` (race detector)
+    - Code coverage ≥ 80%
+  - [ ] Deployment (опционально):
+    - Kubernetes manifests
+    - Helm charts
+    - GitOps (ArgoCD/Flux)
+
+- [ ] **Безопасность**
+  - [ ] Валидация входных данных:
+    - URL: whitelist протоколов (http, https)
+    - Custom code: regex `^[a-zA-Z0-9_-]{3,20}$`
+    - Защита от SSRF (Server-Side Request Forgery)
+  - [ ] Защита от злоупотреблений:
+    - Rate limiting (см. выше)
+    - Blacklist доменов (фишинг, malware)
+    - CAPTCHA для подозрительных запросов (опционально)
+  - [ ] HTTPS/TLS:
+    - Reverse proxy (nginx) с Let's Encrypt
+    - HSTS заголовки
+  - [ ] Секреты:
+    - Не коммитить `.env` (уже в `.gitignore`)
+    - HashiCorp Vault или AWS Secrets Manager (опционально)
+    - Ротация API keys
+
+- [ ] **Расширенная аналитика (опционально)**
+  - [ ] Сохранение метаданных перехода:
+    - `user_agent` → определение устройства/браузера
+    - `referer` → источник перехода
+    - IP → гео (через MaxMind GeoIP2)
+    - `country`, `city`, `device_type`
+  - [ ] Отчёты:
+    - Топ стран
+    - Топ устройств
+    - Топ рефереров
+  - [ ] Endpoint: `GET /api/v1/stats/{short}/detailed`
+
+- [ ] **Документация и собеседование**
+  - [ ] Обновить `README.md`: production deployment guide
+  - [ ] Добавить блок в `INTERVIEW.md`:
+    - Authentication: API Keys vs JWT vs OAuth2 — когда что?
+    - Rate limiting алгоритмы: Token Bucket, Sliding Window, Fixed Window
+    - Observability: три столпа (logs, metrics, traces)
+    - CI/CD best practices
+    - Security: OWASP Top 10 для веб-приложений
+
+### Результаты (ожидаемые)
+
+**Готовность к production:**
+- ✅ Безопасность: аутентификация, rate limiting, HTTPS
+- ✅ Наблюдаемость: логи, метрики, трассировка
+- ✅ Автоматизация: CI/CD pipeline
+- ✅ Документация: deployment guide, security best practices
+
+---
+
+## Чеклист готовности Фазы III
+
+- [ ] Микросервисная архитектура (Link Service + Stats Service)
+- [ ] Kafka для асинхронной коммуникации
+- [ ] Оптимизация алгоритмов (Base62, HyperLogLog, Sorted Sets)
+- [ ] Аутентификация и авторизация (API Keys)
+- [ ] Rate limiting на Redis (Token Bucket)
+- [ ] Наблюдаемость (Prometheus + Grafana + OpenTelemetry)
+- [ ] CI/CD pipeline (GitHub Actions)
+- [ ] Security best practices
+- [ ] INTERVIEW.md обновлён (Этапы 5-7)
+- [ ] README.md обновлён (production guide)
 - [ ] Код закоммичен в GitHub
 
 ---
 
-## Следующий шаг
+## Дальнейшее развитие (после Фазы III)
 
-После завершения Фазы II переходим к **Фазе III — микросервисы** (Этап 5).
+- **Масштабирование:** горизонтальное масштабирование, database sharding, read replicas
+- **Геораспределение:** CDN, multi-region deployment, edge caching
+- **Machine Learning:** предсказание популярных ссылок, детекция аномалий, спам-фильтр
+- **Advanced аналитика:** ClickHouse для больших объёмов, real-time dashboards

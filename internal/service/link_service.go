@@ -12,6 +12,7 @@ import (
 
 	"github.com/UZver24/URL-Shortener/internal/handler/middleware"
 	"github.com/UZver24/URL-Shortener/internal/model"
+	"github.com/UZver24/URL-Shortener/internal/worker"
 )
 
 // LinkRepository — интерфейс для работы с ссылками
@@ -33,16 +34,18 @@ type LinkCache interface {
 // LinkService реализует бизнес-логику для работы со ссылками
 type LinkService struct {
 	repo   LinkRepository
-	cache  LinkCache // опциональный кэш (может быть nil)
+	cache  LinkCache          // опциональный кэш (может быть nil)
+	pool   *worker.WorkerPool // опциональный воркер-пул (может быть nil)
 	logger *slog.Logger
 }
 
 // NewLinkService создаёт новый сервис
-// cache может быть nil — тогда работаем без кэша
-func NewLinkService(repo LinkRepository, logger *slog.Logger, cache LinkCache) *LinkService {
+// cache и pool могут быть nil — тогда работаем без кэша/воркер-пула
+func NewLinkService(repo LinkRepository, logger *slog.Logger, cache LinkCache, pool *worker.WorkerPool) *LinkService {
 	return &LinkService{
 		repo:   repo,
 		cache:  cache,
+		pool:   pool,
 		logger: logger,
 	}
 }
@@ -134,8 +137,8 @@ func (s *LinkService) GetOriginalURL(ctx context.Context, code string) (string, 
 			// Cache hit — используем данные из кэша
 			s.logger.Debug("cache hit", "short_code", code)
 			middleware.RecordCacheHit("get")
-			// Асинхронно увеличиваем счётчик (не блокируем ответ)
-			go s.incrementClicksAsync(link.ID)
+			// Асинхронно увеличиваем счётчик через воркер-пул
+			s.incrementClicksAsync(link.ID, link.ShortCode)
 			return link.OriginalURL, nil
 		}
 		// Cache miss или ошибка — продолжаем с БД
@@ -164,14 +167,35 @@ func (s *LinkService) GetOriginalURL(ctx context.Context, code string) (string, 
 		}
 	}
 
-	// 4. Асинхронно увеличиваем счётчик (не блокируем ответ)
-	go s.incrementClicksAsync(link.ID)
+	// 4. Асинхронно увеличиваем счётчик через воркер-пул
+	s.incrementClicksAsync(link.ID, link.ShortCode)
 
 	return link.OriginalURL, nil
 }
 
-// incrementClicksAsync увеличивает счётчик переходов в фоне
-func (s *LinkService) incrementClicksAsync(linkID int64) {
+// incrementClicksAsync увеличивает счётчик переходов через воркер-пул
+// Если pool недоступен — fallback к простому goroutine (для совместимости)
+func (s *LinkService) incrementClicksAsync(linkID int64, shortCode string) {
+	if s.pool != nil {
+		task := worker.NewTask(linkID, shortCode)
+		if err := s.pool.Submit(task); err != nil {
+			s.logger.Warn("failed to submit task to worker pool",
+				"link_id", linkID,
+				"short_code", shortCode,
+				"error", err,
+			)
+			// Fallback: синхронный increment в фоне
+			go s.syncIncrementClicks(linkID)
+		}
+		return
+	}
+
+	// Fallback: без воркер-пула (для тестов или graceful degradation)
+	go s.syncIncrementClicks(linkID)
+}
+
+// syncIncrementClicks — синхронное увеличение счётчика (fallback)
+func (s *LinkService) syncIncrementClicks(linkID int64) {
 	bgCtx := context.Background()
 	if err := s.repo.IncrementClicks(bgCtx, linkID); err != nil {
 		s.logger.Error("failed to increment clicks",

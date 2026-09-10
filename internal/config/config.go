@@ -24,6 +24,10 @@ type Config struct {
 	RedisDB       int
 	RedisTTL      int // TTL в секундах
 
+	// Worker Pool
+	WorkerCount      int // количество воркеров
+	WorkerBufferSize int // размер буфера канала задач
+
 	// Server
 	ServerPort int
 }
@@ -50,6 +54,10 @@ func Load() (*Config, error) {
 	cfg.RedisPassword = getEnv("REDIS_PASSWORD", "")
 	cfg.RedisDB = getEnvAsInt("REDIS_DB", 0)
 	cfg.RedisTTL = getEnvAsInt("REDIS_TTL", 3600) // 1 час по умолчанию
+
+	// Worker Pool
+	cfg.WorkerCount = getEnvAsInt("WORKER_COUNT", 5)
+	cfg.WorkerBufferSize = getEnvAsInt("WORKER_BUFFER_SIZE", 1000)
 
 	// Server
 	cfg.ServerPort = getEnvAsInt("SERVER_PORT", 8080)

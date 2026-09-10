@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/UZver24/URL-Shortener/internal/model"
+	"github.com/UZver24/URL-Shortener/internal/worker"
 )
 
 // mockRepository — мок-репозиторий для тестов
@@ -170,7 +171,7 @@ func (m *mockCache) Delete(ctx context.Context, shortCode string) error {
 // TestCreateLink_Success — успешное создание ссылки
 func TestCreateLink_Success(t *testing.T) {
 	repo := newMockRepository()
-	svc := NewLinkService(repo, testLogger(), nil) // без кэша
+	svc := NewLinkService(repo, testLogger(), nil, nil) // без кэша
 
 	link, err := svc.CreateLink(context.Background(), "https://example.com", "")
 	if err != nil {
@@ -197,7 +198,7 @@ func TestCreateLink_Success(t *testing.T) {
 // TestCreateLink_InvalidURL — невалидный URL
 func TestCreateLink_InvalidURL(t *testing.T) {
 	repo := newMockRepository()
-	svc := NewLinkService(repo, testLogger(), nil)
+	svc := NewLinkService(repo, testLogger(), nil, nil)
 
 	testCases := []string{
 		"",
@@ -221,7 +222,7 @@ func TestCreateLink_InvalidURL(t *testing.T) {
 // TestCreateLink_DuplicateURL — повторное создание того же URL
 func TestCreateLink_DuplicateURL(t *testing.T) {
 	repo := newMockRepository()
-	svc := NewLinkService(repo, testLogger(), nil)
+	svc := NewLinkService(repo, testLogger(), nil, nil)
 
 	// Первый запрос
 	link1, err := svc.CreateLink(context.Background(), "https://example.com", "")
@@ -249,7 +250,7 @@ func TestCreateLink_DuplicateURL(t *testing.T) {
 // TestCreateLink_CustomCode — пользовательский short_code
 func TestCreateLink_CustomCode(t *testing.T) {
 	repo := newMockRepository()
-	svc := NewLinkService(repo, testLogger(), nil)
+	svc := NewLinkService(repo, testLogger(), nil, nil)
 
 	link, err := svc.CreateLink(context.Background(), "https://example.com", "custom")
 	if err != nil {
@@ -264,7 +265,7 @@ func TestCreateLink_CustomCode(t *testing.T) {
 // TestCreateLink_Collision — коллизия short_code и retry
 func TestCreateLink_Collision(t *testing.T) {
 	repo := newMockRepository()
-	svc := NewLinkService(repo, testLogger(), nil)
+	svc := NewLinkService(repo, testLogger(), nil, nil)
 
 	// Создаём первую ссылку
 	_, err := svc.CreateLink(context.Background(), "https://example1.com", "abc123")
@@ -296,7 +297,7 @@ func TestCreateLink_Collision(t *testing.T) {
 // TestGetOriginalURL_Success — успешное получение URL
 func TestGetOriginalURL_Success(t *testing.T) {
 	repo := newMockRepository()
-	svc := NewLinkService(repo, testLogger(), nil)
+	svc := NewLinkService(repo, testLogger(), nil, nil)
 
 	// Создаём ссылку
 	_, _ = svc.CreateLink(context.Background(), "https://example.com", "test123")
@@ -328,7 +329,7 @@ func TestGetOriginalURL_Success(t *testing.T) {
 // TestGetOriginalURL_NotFound — ссылка не найдена
 func TestGetOriginalURL_NotFound(t *testing.T) {
 	repo := newMockRepository()
-	svc := NewLinkService(repo, testLogger(), nil)
+	svc := NewLinkService(repo, testLogger(), nil, nil)
 
 	_, err := svc.GetOriginalURL(context.Background(), "nonexistent")
 	if !errors.Is(err, model.ErrLinkNotFound) {
@@ -339,7 +340,7 @@ func TestGetOriginalURL_NotFound(t *testing.T) {
 // TestGetStats_Success — получение статистики
 func TestGetStats_Success(t *testing.T) {
 	repo := newMockRepository()
-	svc := NewLinkService(repo, testLogger(), nil)
+	svc := NewLinkService(repo, testLogger(), nil, nil)
 
 	// Создаём ссылку
 	_, _ = svc.CreateLink(context.Background(), "https://example.com", "stats123")
@@ -362,7 +363,7 @@ func TestGetStats_Success(t *testing.T) {
 // TestDeleteLink_Success — успешное удаление
 func TestDeleteLink_Success(t *testing.T) {
 	repo := newMockRepository()
-	svc := NewLinkService(repo, testLogger(), nil)
+	svc := NewLinkService(repo, testLogger(), nil, nil)
 
 	// Создаём ссылку
 	_, _ = svc.CreateLink(context.Background(), "https://example.com", "delete123")
@@ -387,7 +388,7 @@ func TestDeleteLink_Success(t *testing.T) {
 // TestDeleteLink_NotFound — удаление несуществующей ссылки
 func TestDeleteLink_NotFound(t *testing.T) {
 	repo := newMockRepository()
-	svc := NewLinkService(repo, testLogger(), nil)
+	svc := NewLinkService(repo, testLogger(), nil, nil)
 
 	err := svc.DeleteLink(context.Background(), "nonexistent")
 	if !errors.Is(err, model.ErrLinkNotFound) {
@@ -454,7 +455,7 @@ func TestGenerateShortCode(t *testing.T) {
 func TestCacheAside_GetOriginalURL_Hit(t *testing.T) {
 	repo := newMockRepository()
 	cache := newMockCache()
-	svc := NewLinkService(repo, testLogger(), cache)
+	svc := NewLinkService(repo, testLogger(), cache, nil)
 
 	// Предзаполняем кэш
 	link := &model.Link{
@@ -491,7 +492,7 @@ func TestCacheAside_GetOriginalURL_Hit(t *testing.T) {
 func TestCacheAside_GetOriginalURL_Miss(t *testing.T) {
 	repo := newMockRepository()
 	cache := newMockCache()
-	svc := NewLinkService(repo, testLogger(), cache)
+	svc := NewLinkService(repo, testLogger(), cache, nil)
 
 	// Создаём ссылку напрямую в репозиторий (кэш пустой)
 	repo.links["miss123"] = &model.Link{
@@ -535,7 +536,7 @@ func TestCacheAside_GetOriginalURL_Miss(t *testing.T) {
 func TestCacheAside_GetStats_Hit(t *testing.T) {
 	repo := newMockRepository()
 	cache := newMockCache()
-	svc := NewLinkService(repo, testLogger(), cache)
+	svc := NewLinkService(repo, testLogger(), cache, nil)
 
 	// Предзаполняем кэш
 	link := &model.Link{
@@ -569,7 +570,7 @@ func TestCacheAside_GetStats_Hit(t *testing.T) {
 func TestCacheAside_DeleteLink_InvalidatesCache(t *testing.T) {
 	repo := newMockRepository()
 	cache := newMockCache()
-	svc := NewLinkService(repo, testLogger(), cache)
+	svc := NewLinkService(repo, testLogger(), cache, nil)
 
 	// Создаём ссылку
 	_, err := svc.CreateLink(context.Background(), "https://delete-cache.com", "del_cache")
@@ -604,7 +605,7 @@ func TestCacheAside_CacheError_FallbackToDB(t *testing.T) {
 	repo := newMockRepository()
 	cache := newMockCache()
 	cache.getErr = errors.New("redis connection error")
-	svc := NewLinkService(repo, testLogger(), cache)
+	svc := NewLinkService(repo, testLogger(), cache, nil)
 
 	// Создаём ссылку в БД
 	repo.links["fallback"] = &model.Link{
@@ -631,4 +632,91 @@ func TestCacheAside_CacheError_FallbackToDB(t *testing.T) {
 
 	// Даём время для async increment
 	time.Sleep(10 * time.Millisecond)
+}
+
+// ===== Тесты интеграции с WorkerPool =====
+
+// TestWorkerPool_Integration — тест интеграции сервиса с воркер-пулом
+func TestWorkerPool_Integration(t *testing.T) {
+	repo := newMockRepository()
+	cache := newMockCache()
+
+	// Создаём воркер-пул с handler, который вызывает repo.IncrementClicks
+	pool := worker.NewWorkerPool(worker.WorkerPoolConfig{
+		Workers:    2,
+		BufferSize: 100,
+		Handler: func(ctx context.Context, task worker.Task) error {
+			return repo.IncrementClicks(ctx, task.LinkID)
+		},
+		Logger: testLogger(),
+	})
+	pool.Start()
+	defer pool.Stop()
+
+	svc := NewLinkService(repo, testLogger(), cache, pool)
+
+	// Создаём ссылку
+	link, err := svc.CreateLink(context.Background(), "https://worker-pool.com", "worker")
+	if err != nil {
+		t.Fatalf("failed to create link: %v", err)
+	}
+
+	// Получаем URL несколько раз (увеличивает счётчик через pool)
+	for i := 0; i < 5; i++ {
+		_, err := svc.GetOriginalURL(context.Background(), "worker")
+		if err != nil {
+			t.Fatalf("GetOriginalURL failed: %v", err)
+		}
+	}
+
+	// Даём время воркер-пулу обработать задачи
+	time.Sleep(100 * time.Millisecond)
+
+	// Останавливаем пул (graceful)
+	pool.Stop()
+
+	// Проверяем, что счётчик увеличился
+	if link.Clicks != 5 {
+		t.Errorf("expected clicks=5, got %d", link.Clicks)
+	}
+}
+
+// TestWorkerPool_FallbackWhenPoolClosed — fallback к sync increment при закрытом пуле
+func TestWorkerPool_FallbackWhenPoolClosed(t *testing.T) {
+	repo := newMockRepository()
+
+	pool := worker.NewWorkerPool(worker.WorkerPoolConfig{
+		Workers:    2,
+		BufferSize: 100,
+		Handler: func(ctx context.Context, task worker.Task) error {
+			return repo.IncrementClicks(ctx, task.LinkID)
+		},
+		Logger: testLogger(),
+	})
+	pool.Start()
+
+	svc := NewLinkService(repo, testLogger(), nil, pool)
+
+	// Создаём ссылку
+	link, err := svc.CreateLink(context.Background(), "https://fallback.com", "fb")
+	if err != nil {
+		t.Fatalf("failed to create link: %v", err)
+	}
+
+	// Останавливаем пул
+	pool.Stop()
+
+	// Теперь pool.Submit вернёт ErrPoolClosed → fallback к sync increment
+	_, err = svc.GetOriginalURL(context.Background(), "fb")
+	if err != nil {
+		t.Fatalf("GetOriginalURL failed: %v", err)
+	}
+
+	// Даём время для async increment (fallback)
+	time.Sleep(50 * time.Millisecond)
+
+	// Счётчик должен увеличиться
+	if link.Clicks != 1 {
+		t.Errorf("expected clicks=1 (fallback worked), got %d", link.Clicks)
+	}
 }

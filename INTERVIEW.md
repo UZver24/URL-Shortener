@@ -2202,3 +2202,670 @@ docker-compose logs redis
 ## Следующий этап
 
 После изучения этих вопросов переходим к **Этапу 4: Конкурентность** (воркер-пул для асинхронной записи счётчиков).
+
+---
+
+# Собеседование по Этапу 4: Конкурентность
+
+> Документация с типичными вопросами на техническом собеседовании и подробными ответами по теме конкурентности в Go, воркер-пулов и graceful shutdown.
+
+---
+
+## Основы конкурентности в Go
+
+### 1. Что такое конкурентность в Go? Goroutines vs threads
+
+**Ответ:**
+
+**Конкурентность** — это способность программы выполнять несколько задач одновременно (или псевдо-одновременно).
+
+**Goroutine vs OS Thread:**
+
+| Критерий | Goroutine | OS Thread |
+|----------|-----------|-----------|
+| **Размер стека** | 2KB (динамический) | 1-8MB (фиксированный) |
+| **Создание** | Дешёвое (~300ns) | Дорогое (~1μs) |
+| **Переключение** | M:N scheduler (Go runtime) | Kernel scheduler |
+| **Количество** | Миллионы | Тысячи |
+| **Управление** | Go runtime | ОС |
+| **Блокировка** | Кооперативная | Вытесняющая |
+
+**Почему goroutines эффективны:**
+
+1. **Маленький стек:** 2KB vs 1MB — можно создать миллионы goroutines
+2. **M:N scheduler:** Go runtime мультиплексирует N goroutines на M OS threads
+3. **Work stealing:** Свободные threads забирают задачи у занятых
+4. **Кооперативная многозадачность:** Переключение только в safe points (channel ops, function calls)
+
+**Пример:**
+
+```go
+// OS threads (тяжело)
+for i := 0; i < 10000; i++ {
+    thread_create(...)  // ~1μs, 1MB стек
+}
+
+// Goroutines (легко)
+for i := 0; i < 1000000; i++ {
+    go func() { ... }()  // ~300ns, 2KB стек
+}
+```
+
+**Когда использовать goroutines:**
+- I/O-bound задачи (HTTP requests, DB queries, file operations)
+- Параллельная обработка данных
+- Event-driven системы
+
+**Когда НЕ использовать:**
+- CPU-bound задачи (math, cryptography) — используйте worker pool
+- Когда нужен строгий контроль над threads (real-time systems)
+
+**Для нашего проекта:**
+
+Мы используем goroutines для асинхронного обновления счётчика:
+```go
+go func() {
+    s.repo.IncrementClicks(bgCtx, link.ID)
+}()
+```
+
+Но это создаёт неограниченное количество goroutines при высокой нагрузке. Решение — **worker pool** (см. вопрос 3).
+
+---
+
+### 2. Каналы: буферизированные vs небуферизированные
+
+**Ответ:**
+
+**Канал (channel)** — это типизированный конвейер для коммуникации между goroutines.
+
+**Небуферизированные каналы:**
+
+```go
+ch := make(chan int)  // или make(chan int, 0)
+```
+
+**Поведение:**
+- Отправка блокируется, пока нет получателя
+- Получение блокируется, пока нет отправителя
+- **Синхронная коммуникация** (rendezvous)
+
+**Пример:**
+
+```go
+ch := make(chan int)
+
+go func() {
+    fmt.Println("Sending...")
+    ch <- 42  // блокируется, пока main не прочитает
+    fmt.Println("Sent")
+}()
+
+time.Sleep(1 * time.Second)
+fmt.Println("Receiving...")
+value := <-ch  // разблокирует sender
+fmt.Println(value)
+```
+
+Вывод:
+```
+Sending...
+(пауза 1 секунда)
+Receiving...
+Sent
+42
+```
+
+**Буферизированные каналы:**
+
+```go
+ch := make(chan int, 10)  // буфер на 10 элементов
+```
+
+**Поведение:**
+- Отправка блокируется, если буфер полон
+- Получение блокируется, если буфер пуст
+- **Асинхронная коммуникация** (до заполнения буфера)
+
+**Пример:**
+
+```go
+ch := make(chan int, 3)
+
+ch <- 1  // не блокируется (буфер пуст)
+ch <- 2  // не блокируется
+ch <- 3  // не блокируется (буфер полон)
+ch <- 4  // БЛОКИРУЕТСЯ (буфер полон, нет получателя)
+```
+
+**Сравнительная таблица:**
+
+| Критерий | Небуферизированный | Буферизированный |
+|----------|-------------------|------------------|
+| **Синхронизация** | Строгая | Слабая (до заполнения буфера) |
+| **Производительность** | Ниже (всегда блокировка) | Выше (если буфер не полон) |
+| **Использование** | Синхронизация, события | Очереди, batch processing |
+| **Deadlock риск** | Высокий (если нет пары) | Низкий (если буфер достаточен) |
+
+**Когда использовать небуферизированные:**
+- Синхронизация goroutines (ping-pong, barrier)
+- Event notifications (сигнал о завершении)
+- Когда нужна строгая синхронизация
+
+**Когда использовать буферизированные:**
+- Producer-consumer паттерн
+- Worker pools (очередь задач)
+- Batch processing
+- Когда producer быстрее consumer
+
+**Для нашего проекта:**
+
+Мы используем **буферизированный канал** для worker pool:
+```go
+type WorkerPool struct {
+    tasks chan Task  // буферизированный канал задач
+}
+
+func NewWorkerPool(workers, bufferSize int) *WorkerPool {
+    return &WorkerPool{
+        tasks: make(chan Task, bufferSize),  // буфер на bufferSize задач
+    }
+}
+```
+
+Почему буферизированный:
+- HTTP handlers не блокируются (если буфер не полон)
+- Сглаживает пики нагрузки (burst traffic)
+- Producer (HTTP handler) быстрее consumer (worker)
+
+---
+
+## Worker Pool Pattern
+
+### 3. Паттерн Worker Pool: зачем нужен, как реализовать?
+
+**Ответ:**
+
+**Worker Pool** — это паттерн, при котором фиксированное количество воркеров (goroutines) обрабатывают задачи из общей очереди.
+
+**Зачем нужен:**
+
+| Проблема без worker pool | Решение с worker pool |
+|--------------------------|----------------------|
+| Неограниченное количество goroutines | Фиксированное число воркеров |
+| High memory usage (миллионы goroutines) | Контролируемое потребление памяти |
+| Нет контроля над concurrency | Ограниченная параллельность |
+| Сложно graceful shutdown | Простой graceful shutdown |
+| Нет retry при ошибках | Exponential backoff в worker |
+
+**Пример из нашего проекта:**
+
+**Без worker pool (плохо):**
+```go
+func (s *LinkService) GetOriginalURL(ctx context.Context, code string) (string, error) {
+    link, err := s.repo.GetByCode(ctx, code)
+    if err != nil {
+        return "", err
+    }
+    
+    // Проблема: создаём goroutine на каждый запрос
+    go func() {
+        s.repo.IncrementClicks(bgCtx, link.ID)
+    }()
+    
+    return link.OriginalURL, nil
+}
+```
+
+При 1000 RPS: 1000 goroutines/сек × 60 сек = 60,000 goroutines
+
+**С worker pool (хорошо):**
+```go
+func (s *LinkService) GetOriginalURL(ctx context.Context, code string) (string, error) {
+    link, err := s.repo.GetByCode(ctx, code)
+    if err != nil {
+        return "", err
+    }
+    
+    // Решение: отправляем задачу в worker pool
+    task := worker.Task{LinkID: link.ID}
+    s.pool.Submit(task)  // не блокируется (если буфер не полон)
+    
+    return link.OriginalURL, nil
+}
+```
+
+При 1000 RPS: 5 воркеров × 1000 задач в буфере = максимум 1005 goroutines
+
+**Реализация Worker Pool:**
+
+```go
+type WorkerPool struct {
+    tasks      chan Task       // буферизированный канал задач
+    handler    TaskHandler     // функция-обработчик
+    workers    int             // количество воркеров
+    wg         sync.WaitGroup  // для graceful shutdown
+    logger     *slog.Logger
+    maxRetries int             // для exponential backoff
+    baseDelay  time.Duration
+}
+
+func NewWorkerPool(cfg WorkerPoolConfig) *WorkerPool {
+    return &WorkerPool{
+        tasks:   make(chan Task, cfg.BufferSize),
+        handler: cfg.Handler,
+        workers: cfg.Workers,
+        // ...
+    }
+}
+
+func (p *WorkerPool) Start() {
+    for i := 0; i < p.workers; i++ {
+        p.wg.Add(1)
+        go p.worker(i)
+    }
+}
+
+func (p *WorkerPool) worker(id int) {
+    defer p.wg.Done()
+    
+    for task := range p.tasks {  // читаем из канала
+        p.processTask(id, task)  // обрабатываем задачу
+    }
+}
+
+func (p *WorkerPool) Submit(task Task) error {
+    select {
+    case p.tasks <- task:  // non-blocking send
+        return nil
+    default:
+        return ErrQueueFull  // буфер полон
+    }
+}
+
+func (p *WorkerPool) Stop() error {
+    close(p.tasks)  // закрываем канал — воркеры выйдут из for range
+    p.wg.Wait()     // ждём завершения всех воркеров
+    return nil
+}
+```
+
+**Ключевые моменты:**
+
+1. **Фиксированное число воркеров:** Контроль над concurrency
+2. **Буферизированный канал:** Сглаживает пики нагрузки
+3. **Non-blocking submit:** HTTP handlers не блокируются
+4. **Graceful shutdown:** `close(tasks)` + `wg.Wait()`
+5. **Error handling:** Exponential backoff в `processTask`
+
+---
+
+### 4. `sync.WaitGroup`: для чего используется?
+
+**Ответ:**
+
+**WaitGroup** — это примитив синхронизации для ожидания завершения группы goroutines.
+
+**Методы:**
+
+| Метод | Описание |
+|-------|----------|
+| `Add(delta int)` | Увеличивает счётчик на delta |
+| `Done()` | Уменьшает счётчик на 1 (вызывается в goroutine) |
+| `Wait()` | Блокируется, пока счётчик не станет 0 |
+
+**Пример:**
+
+```go
+var wg sync.WaitGroup
+
+for i := 0; i < 5; i++ {
+    wg.Add(1)  // увеличиваем счётчик
+    go func(id int) {
+        defer wg.Done()  // уменьшаем счётчик при завершении
+        fmt.Printf("Worker %d started\n", id)
+        time.Sleep(1 * time.Second)
+        fmt.Printf("Worker %d done\n", id)
+    }(i)
+}
+
+fmt.Println("Waiting for workers...")
+wg.Wait()  // блокируется, пока все 5 goroutines не завершатся
+fmt.Println("All workers done")
+```
+
+**Почему `defer wg.Done()`:**
+- Гарантирует, что счётчик уменьшится даже при panic
+- Читаемость: явно видно, что goroutine "регистрируется"
+
+**Для нашего проекта:**
+
+Мы используем WaitGroup для graceful shutdown worker pool:
+
+```go
+func (p *WorkerPool) Start() {
+    for i := 0; i < p.workers; i++ {
+        p.wg.Add(1)  // регистрируем воркер
+        go p.worker(i)
+    }
+}
+
+func (p *WorkerPool) worker(id int) {
+    defer p.wg.Done()  // уменьшаем счётчик при завершении
+    
+    for task := range p.tasks {
+        p.processTask(id, task)
+    }
+}
+
+func (p *WorkerPool) Stop() error {
+    close(p.tasks)  // закрываем канал — воркеры выйдут из for range
+    p.wg.Wait()     // ждём, пока все воркеры завершатся
+    return nil
+}
+```
+
+**Порядок graceful shutdown:**
+1. `close(tasks)` — воркеры перестают получать новые задачи
+2. Воркеры завершают текущие задачи и выходят из `for range`
+3. `defer wg.Done()` уменьшает счётчик
+4. `wg.Wait()` разблокируется, когда все воркеры завершатся
+
+---
+
+## Graceful Shutdown
+
+### 5. Graceful shutdown: как правильно остановить воркеры?
+
+**Ответ:**
+
+**Graceful shutdown** — это корректное завершение работы, при котором:
+1. Не принимаются новые запросы
+2. Активные запросы завершаются
+3. Очередь задач обрабатывается
+4. Соединения закрываются
+
+**Порядок graceful shutdown:**
+
+```
+1. Получить сигнал (SIGTERM/SIGINT)
+   ↓
+2. Остановить HTTP-сервер (не принимать новые запросы)
+   ↓
+3. Остановить worker pool (обработать оставшиеся задачи)
+   ↓
+4. Закрыть Redis
+   ↓
+5. Закрыть PostgreSQL
+```
+
+**Из нашего `main.go`:**
+
+```go
+// Graceful shutdown
+quit := make(chan os.Signal, 1)
+signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+sig := <-quit
+
+logger.Info("received shutdown signal", "signal", sig.String())
+
+ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+
+// 1. Останавливаем HTTP-сервер
+if err := server.Shutdown(ctx); err != nil {
+    logger.Error("server forced to shutdown", "error", err)
+}
+
+// 2. Останавливаем worker pool (обрабатываем оставшиеся задачи)
+if err := workerPool.Stop(); err != nil {
+    logger.Error("worker pool shutdown failed", "error", err)
+}
+
+// 3. Закрываем Redis
+if redisClient != nil {
+    redisClient.Close()
+}
+
+// 4. PostgreSQL закрывается через defer pool.Close()
+
+logger.Info("server stopped gracefully")
+```
+
+**Почему такой порядок:**
+
+1. **HTTP server first:** Перестаём принимать новые запросы
+2. **Worker pool second:** Обрабатываем оставшиеся задачи (они могут использовать БД)
+3. **Redis/PostgreSQL last:** Закрываем соединения после завершения всех операций
+
+**Что если поменять порядок:**
+
+```go
+// НЕПРАВИЛЬНО: закрываем БД до worker pool
+pool.Close()  // PostgreSQL закрыт
+workerPool.Stop()  // воркеры пытаются использовать БД → ошибки
+```
+
+**Worker pool shutdown:**
+
+```go
+func (p *WorkerPool) Stop() error {
+    close(p.tasks)  // закрываем канал задач
+    
+    // Воркеры:
+    // for task := range p.tasks { ... }
+    // range выходит, когда канал закрыт и пуст
+    
+    p.wg.Wait()  // ждём завершения всех воркеров
+    return nil
+}
+```
+
+**Почему `close(tasks)` работает:**
+- `for range` читает из канала, пока он не закрыт И пуст
+- После `close` воркеры обработают оставшиеся задачи и выйдут
+- Это гарантирует, что все задачи из буфера будут обработаны
+
+---
+
+## Exponential Backoff
+
+### 6. Exponential backoff: что это, зачем нужно?
+
+**Ответ:**
+
+**Exponential backoff** — это стратегия повторных попыток с увеличивающейся задержкой.
+
+**Зачем нужно:**
+1. **Избежать thundering herd:** Все клиенты не retry одновременно
+2. **Дать системе восстановиться:** Увеличивающаяся задержка
+3. **Снизить нагрузку:** Меньше retry при длительных сбоях
+
+**Формула:**
+
+```
+delay = baseDelay * 2^attempt
+```
+
+**Пример (baseDelay = 1s):**
+
+| Попытка | Задержка | Общее время |
+|---------|----------|-------------|
+| 1 | 1s | 1s |
+| 2 | 2s | 3s |
+| 3 | 4s | 7s |
+| 4 | 8s | 15s |
+| 5 | 16s | 31s |
+
+**Из нашего проекта:**
+
+```go
+func (p *WorkerPool) processTask(workerID int, task Task) {
+    var lastErr error
+    for attempt := 0; attempt < p.maxRetries; attempt++ {
+        err := p.handler(ctx, task)
+        if err == nil {
+            return  // успех
+        }
+        
+        lastErr = err
+        p.logger.Warn("task failed, retrying", "attempt", attempt+1, "error", err)
+        
+        // Exponential backoff: 1s, 2s, 4s, 8s, 16s
+        if attempt < p.maxRetries-1 {
+            delay := p.baseDelay * time.Duration(1<<uint(attempt))
+            if delay > 16*time.Second {
+                delay = 16 * time.Second  // cap
+            }
+            time.Sleep(delay)
+        }
+    }
+    
+    // Все попытки провалились
+    p.logger.Error("task failed after all retries", "error", lastErr)
+}
+```
+
+**Когда использовать:**
+- Временные ошибки (network timeout, DB unavailable)
+- Rate limiting (HTTP 429)
+- Distributed systems (eventual consistency)
+
+**Когда НЕ использовать:**
+- Постоянные ошибки (invalid input, not found)
+- Когда нужна быстрая реакция (real-time systems)
+- Когда retry может ухудшить ситуацию (write operations без idempotency)
+
+**Улучшения:**
+
+1. **Jitter (случайность):**
+   ```go
+   delay := baseDelay * 2^attempt + rand(0, baseDelay)
+   ```
+   Предотвращает синхронизацию retry
+
+2. **Circuit breaker:**
+   ```go
+   if failures > threshold {
+       return ErrCircuitOpen  // не retry
+   }
+   ```
+   Прекращает retry при длительных сбоях
+
+---
+
+## Batch Processing
+
+### 7. Batch-обработки: преимущества, как реализовать?
+
+**Ответ:**
+
+**Batch processing** — это группировка нескольких операций в одну для снижения нагрузки на систему.
+
+**Преимущества:**
+
+| Критерий | Single | Batch (100) |
+|----------|--------|-------------|
+| **DB queries** | 100 | 1 |
+| **Network roundtrips** | 100 | 1 |
+| **Latency** | 100 × 5ms = 500ms | 1 × 10ms = 10ms |
+| **DB load** | Высокая | Низкая |
+
+**SQL batch update:**
+
+```sql
+-- Single update (100 раз)
+UPDATE links SET clicks = clicks + 1 WHERE id = 1;
+UPDATE links SET clicks = clicks + 1 WHERE id = 2;
+...
+
+-- Batch update (1 раз)
+UPDATE links
+SET clicks = clicks + batch.count
+FROM (VALUES (1, 5), (2, 3), (3, 10)) AS batch(id, count)
+WHERE links.id = batch.id;
+```
+
+**Реализация в worker pool:**
+
+```go
+type BatchingWorker struct {
+    tasks     chan Task
+    batch     []Task
+    batchSize int
+    flushInterval time.Duration
+    ticker    *time.Ticker
+}
+
+func (w *BatchingWorker) Run() {
+    w.ticker = time.NewTicker(w.flushInterval)
+    defer w.ticker.Stop()
+    
+    for {
+        select {
+        case task := <-w.tasks:
+            w.batch = append(w.batch, task)
+            if len(w.batch) >= w.batchSize {
+                w.flush()
+            }
+        case <-w.ticker.C:
+            if len(w.batch) > 0 {
+                w.flush()
+            }
+        }
+    }
+}
+
+func (w *BatchingWorker) flush() {
+    // Batch UPDATE
+    query := `
+        UPDATE links
+        SET clicks = clicks + batch.count
+        FROM (VALUES ...) AS batch(id, count)
+        WHERE links.id = batch.id
+    `
+    w.db.Exec(query, w.batch)
+    w.batch = w.batch[:0]  // очищаем batch
+}
+```
+
+**Когда использовать:**
+- Write-heavy нагрузка
+- Batch операции допустимы (не нужна immediate consistency)
+- Снижение нагрузки на БД критично
+
+**Когда НЕ использовать:**
+- Real-time updates (нужна immediate consistency)
+- Малое количество операций (overhead > benefit)
+- Сложная логика (каждая операция уникальна)
+
+**Для нашего проекта:**
+
+Batch processing — опциональное улучшение для Этапа 4. Текущая реализация (single update с worker pool) достаточна для большинства сценариев.
+
+---
+
+## Итого
+
+**Ключевые темы для собеседования:**
+
+1. **Goroutines vs threads** — лёгкость создания, M:N scheduler
+2. **Каналы** — буферизированные vs небуферизированные, когда что использовать
+3. **Worker pool** — контроль над concurrency, graceful shutdown
+4. **sync.WaitGroup** — ожидание завершения группы goroutines
+5. **Graceful shutdown** — правильный порядок завершения компонентов
+6. **Exponential backoff** — retry стратегия с увеличивающейся задержкой
+7. **Batch processing** — группировка операций для снижения нагрузки
+
+**Дополнительные вопросы для самопроверки:**
+- Что такое race condition и как его избежать (mutex, atomic, channels)?
+- Как работает Go scheduler (GOMAXPROCS, work stealing)?
+- Что такое context и зачем он нужен (cancellation, timeout)?
+- Как реализовать pub/sub паттерн на каналах?
+- Что такое fan-in/fan-out паттерны?
+
+---
+
+## Следующий этап
+
+После изучения этих вопросов переходим к **Этапу 5: Микросервисы** (выделение Stats Service, Kafka).

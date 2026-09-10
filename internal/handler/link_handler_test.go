@@ -85,7 +85,7 @@ func setupTestServer() (*LinkHandler, *mockRepository) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelError, // только ошибки в тестах
 	}))
-	svc := service.NewLinkService(repo, logger, nil) // без кэша
+	svc := service.NewLinkService(repo, logger, nil, nil) // без кэша и пула
 	handler := NewLinkHandler(svc)
 	return handler, repo
 }

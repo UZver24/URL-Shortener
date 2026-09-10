@@ -17,6 +17,7 @@ import (
 	"github.com/UZver24/URL-Shortener/internal/repository/postgres"
 	redisrepo "github.com/UZver24/URL-Shortener/internal/repository/redis"
 	"github.com/UZver24/URL-Shortener/internal/service"
+	"github.com/UZver24/URL-Shortener/internal/worker"
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
@@ -85,7 +86,37 @@ func main() {
 
 	// 7. Инициализируем слои приложения
 	linkRepo := postgres.NewLinkRepository(pool)
-	linkService := service.NewLinkService(linkRepo, logger, linkCache)
+
+	// 8. Создаём воркер-пул для асинхронного обновления счётчика
+	// Handler для воркер-пула — инкремент clicks в БД
+	taskHandler := func(ctx context.Context, task worker.Task) error {
+		return linkRepo.IncrementClicks(ctx, task.LinkID)
+	}
+
+	workerPool := worker.NewWorkerPool(worker.WorkerPoolConfig{
+		Workers:    cfg.WorkerCount,
+		BufferSize: cfg.WorkerBufferSize,
+		Handler:    taskHandler,
+		Logger:     logger,
+	})
+
+	// Регистрируем Gauge для размера очереди воркера
+	workerQueueGauge := promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "worker_queue_size",
+		Help: "Current size of the worker pool queue",
+	})
+	middleware.SetWorkerQueueSizeGauge(workerQueueGauge)
+
+	// Запускаем воркер-пул
+	workerPool.Start()
+
+	logger.Info("worker pool started",
+		"workers", cfg.WorkerCount,
+		"buffer_size", cfg.WorkerBufferSize,
+	)
+
+	// 9. Создаём сервис с кэшем и воркер-пулом
+	linkService := service.NewLinkService(linkRepo, logger, linkCache, workerPool)
 	linkHandler := handler.NewLinkHandler(linkService)
 
 	// Создаём HealthHandler с Redis (если доступен)
@@ -147,6 +178,13 @@ func main() {
 
 	if err := server.Shutdown(ctx); err != nil {
 		logger.Error("server forced to shutdown", "error", err)
+	}
+
+	// Останавливаем воркер-пул (обрабатываем оставшиеся задачи)
+	// ВАЖНО: pool.Stop() должен быть вызван до закрытия БД,
+	// так как воркеры используют БД для обработки задач
+	if err := workerPool.Stop(); err != nil {
+		logger.Error("worker pool shutdown failed", "error", err)
 	}
 
 	// Закрываем Redis (если был подключён)

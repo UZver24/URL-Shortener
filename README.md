@@ -183,6 +183,13 @@ curl http://localhost:8080/metrics
 - `db_pool_active_connections` — активные соединения с БД
 - `db_pool_idle_connections` — свободные соединения с БД
 - `db_pool_total_connections` — всего соединений в пуле
+- `cache_hits_total` — количество попаданий в кэш (operation)
+- `cache_misses_total` — количество промахов в кэше (operation)
+- `cache_errors_total` — количество ошибок кэша (operation)
+- `worker_queue_size` — текущий размер очереди воркер-пула
+- `worker_tasks_processed_total` — количество обработанных задач (status)
+- `worker_errors_total` — количество ошибок обработки задач
+- `worker_processing_duration_seconds` — время обработки задачи воркером
 
 ### Примеры запросов
 
@@ -214,14 +221,15 @@ curl http://localhost:8080/nonexistent
 
 - **Язык:** Go (версия 1.22+)
 - **СУБД:** PostgreSQL 16+
+- **Кэш:** Redis 7+
 - **HTTP-сервер:** стандартная библиотека `net/http` (без фреймворков на первом этапе)
 - **Драйвер БД:** `github.com/jackc/pgx/v5` (или `database/sql` + `lib/pq`)
+- **Redis клиент:** `github.com/redis/go-redis/v9`
 - **Конфигурация:** переменные окружения + `github.com/joho/godotenv`
 - **Логирование:** `log/slog` (стандартная библиотека)
 - **Контейнеризация:** Docker + docker-compose
 - **Миграции:** `golang-migrate/migrate` или ручные SQL-скрипты
 - **Тестирование:** стандартный `testing` + `httptest`
-- **Кэш (этап 3):** Redis
 - **Очереди (этап 5):** Kafka или RabbitMQ (по желанию)
 
 ## Принципы работы над проектом
@@ -294,10 +302,12 @@ url-shortener/
 ├── internal/
 │   ├── config/                  # конфигурация из env
 │   ├── handler/                 # HTTP-обработчики
+│   │   └── middleware/          # RequestID, Logging, Metrics
 │   ├── service/                 # бизнес-логика
 │   ├── repository/              # работа с БД
-│   │   ├── postgres/
-│   │   └── cache/               # (этап 3) Redis
+│   │   ├── postgres/            # PostgreSQL
+│   │   └── redis/               # Redis кэш
+│   ├── worker/                  # воркер-пул для асинхронных задач
 │   └── model/                   # доменные типы
 ├── migrations/                  # SQL-миграции
 ├── docker-compose.yml
@@ -335,18 +345,22 @@ url-shortener/
 - Метрики и health-check эндпоинты (`/health`, `/metrics`).
 - Сборка Docker-образа, деплой через docker-compose.
 
-### Этап 3. Кэш (Redis)
+### Этап 3. Кэш (Redis) ✅
 
 - Почему кэш: 80% запросов — это `GET /{short}`, и они читают одни и те же данные.
 - Cache-aside паттерн: сначала Redis, потом PostgreSQL.
 - Инвалидация кэша при удалении.
 - Обсуждение TTL и стратегий вытеснения.
+- Graceful degradation при недоступности Redis.
+- Метрики hit/miss/errors.
 
-### Этап 4. Конкурентность
+### Этап 4. Конкурентность ✅
 
 - Асинхронная запись статистики через канал + воркер-пул.
 - `sync.WaitGroup`, буферизированные каналы, graceful stop воркеров.
+- Exponential backoff при ошибках БД.
 - Обсуждение: когда каналы, а когда мьютексы.
+- Метрики воркер-пула (queue size, processed, errors).
 
 ### Этап 5. Микросервисы
 

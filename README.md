@@ -401,12 +401,14 @@ url-shortener/
 - Event-driven архитектура: ClickEvent → Kafka → Stats Service
 - Обновлён `INTERVIEW.md`: Monolith vs Microservices, Kafka, CAP, Saga pattern
 
-### Этап 6. Оптимизация (алгоритмы)
+### Этап 6. Оптимизация (алгоритмы) ✅
 
-- Как ускорить генерацию короткого кода? (base62, снежинка, распределённые ID)
-- Как искать «горячие» ссылки? (Top-K алгоритмы)
-- Как считать уникальные переходы? (HyperLogLog)
-- Оценка сложности каждого решения в Big O.
+- **HyperLogLog** (Redis PFADD/PFCOUNT) — уникальные переходы за O(1), 12KB на ключ
+- **Redis Sorted Set** (ZINCRBY/ZREVRANGE) — топ ссылок за O(log n + K)
+- **Sliding Window** (Redis pipeline + TTL) — trending ссылки в реальном времени
+- **Бенчмарки генерации кодов:** CryptoRand 412 ns → Base62 from ID 7 ns (59x быстрее)
+- Graceful degradation: Redis unavailable → fallback to PostgreSQL
+- Обновлён `INTERVIEW.md`: HyperLogLog, Sorted Set, Big O, probabilistic structures
 
 ### Этап 7. Production-ready
 

@@ -17,6 +17,7 @@ import (
 	kafkapkg "github.com/UZver24/URL-Shortener/internal/messaging/kafka"
 	"github.com/UZver24/URL-Shortener/internal/repository/postgres"
 	"github.com/UZver24/URL-Shortener/internal/repository/postgres/stats"
+	redisrepo "github.com/UZver24/URL-Shortener/internal/repository/redis"
 	"github.com/UZver24/URL-Shortener/internal/service"
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
@@ -70,9 +71,19 @@ func main() {
 	// 5. Регистрируем метрики БД
 	registerDBMetrics(pool)
 
+	// 6. Подключаемся к Redis (для аналитики: HyperLogLog, Sorted Set, Sliding Window)
+	var analyticsCache service.AnalyticsCache
+	redisClient, err := redisrepo.NewClient(cfg.RedisAddr(), cfg.RedisPassword, cfg.RedisDB, logger)
+	if err != nil {
+		logger.Warn("failed to connect to Redis, running without analytics cache", "error", err)
+	} else {
+		analyticsCache = redisrepo.NewAnalyticsCache(redisClient.GetClient(), logger)
+		logger.Info("Redis analytics cache enabled")
+	}
+
 	// 6. Инициализируем слои приложения
 	statsRepo := stats.NewStatsRepository(pool)
-	statsService := service.NewStatsService(statsRepo, logger)
+	statsService := service.NewStatsService(statsRepo, logger, analyticsCache)
 
 	// 7. Создаём Kafka Consumer
 	kafkaConsumer, err := kafkapkg.NewConsumer(kafkapkg.ConsumerConfig{

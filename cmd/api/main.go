@@ -19,6 +19,10 @@ import (
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 //go:embed migrations/*.sql
@@ -60,13 +64,21 @@ func main() {
 
 	logger.Info("migrations completed")
 
-	// 5. Инициализируем слои приложения
+	// 5. Регистрируем метрики БД
+	registerDBMetrics(pool)
+
+	// 6. Инициализируем слои приложения
 	linkRepo := postgres.NewLinkRepository(pool)
 	linkService := service.NewLinkService(linkRepo, logger)
 	linkHandler := handler.NewLinkHandler(linkService)
+	healthHandler := handler.NewHealthHandler(pool)
 
-	// 6. Настраиваем маршруты
+	// 7. Настраиваем маршруты
 	mux := http.NewServeMux()
+
+	// Health-check и метрики
+	mux.HandleFunc("GET /health", healthHandler.Health)
+	mux.Handle("GET /metrics", promhttp.Handler())
 
 	// API endpoints
 	mux.HandleFunc("POST /api/v1/links", linkHandler.CreateLink)
@@ -76,9 +88,9 @@ func main() {
 	// Redirect endpoint (должен быть последним, так как перехватывает все GET /{short})
 	mux.HandleFunc("GET /{short}", linkHandler.Redirect)
 
-	// 7. Применяем middleware в правильном порядке (снаружи → внутрь):
-	//    Запрос → RequestID → Logging → mux → Handler → Ответ
-	handler := middleware.RequestID(middleware.Logging(logger)(mux))
+	// 8. Применяем middleware в правильном порядке (снаружи → внутрь):
+	//    Запрос → RequestID → Metrics → Logging → mux → Handler → Ответ
+	handler := middleware.RequestID(middleware.Metrics(middleware.Logging(logger)(mux)))
 
 	// 8. Создаём HTTP-сервер
 	server := &http.Server{
@@ -136,4 +148,40 @@ func runMigrations(databaseURL string) error {
 	}
 
 	return nil
+}
+
+// registerDBMetrics регистрирует метрики для пула соединений БД
+func registerDBMetrics(pool *pgxpool.Pool) {
+	promauto.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Name: "db_pool_active_connections",
+			Help: "Number of active database connections",
+		},
+		func() float64 {
+			stat := pool.Stat()
+			return float64(stat.TotalConns() - stat.IdleConns())
+		},
+	)
+
+	promauto.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Name: "db_pool_idle_connections",
+			Help: "Number of idle database connections",
+		},
+		func() float64 {
+			stat := pool.Stat()
+			return float64(stat.IdleConns())
+		},
+	)
+
+	promauto.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Name: "db_pool_total_connections",
+			Help: "Total number of database connections in pool",
+		},
+		func() float64 {
+			stat := pool.Stat()
+			return float64(stat.TotalConns())
+		},
+	)
 }

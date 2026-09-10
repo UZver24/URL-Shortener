@@ -145,35 +145,50 @@
 - [x] **Индексы в БД** (добавлены сразу в первую миграцию)
   - [x] `UNIQUE INDEX idx_links_short_code`
   - [x] `INDEX idx_links_original_url`
-  - [ ] ⚠️ Обсудить: B-tree vs Hash, когда какой использовать
+  - [x] Обсуждение: B-tree vs Hash — в `INTERVIEW.md`
 
-### ❌ Осталось сделать
+### ✅ Выполнено (Этап 2)
 
-- [ ] **Health-check эндпоинт**
-  - [ ] `GET /health` — проверка готовности
-  - [ ] Response: `{"status": "ok"}` или `{"status": "error", "reason": "..."}`
-  - [ ] Проверка соединения с БД через `pool.Ping()`
+- [x] **Health-check эндпоинт** — `internal/handler/health_handler.go`
+  - [x] `GET /health` — проверка готовности
+  - [x] Response: `{"status": "ok", "database": "ok"}` или `{"status": "error", "error": "..."}`
+  - [x] Проверка соединения с БД через `pool.Ping(ctx)` с таймаутом 2 секунды
+  - [x] HTTP 200 при успехе, HTTP 503 при ошибке
 
-- [ ] **Prometheus-метрики (опционально)**
-  - [ ] `GET /metrics` — эндпоинт для Prometheus
-  - [ ] Счётчик запросов по методам и статусам
-  - [ ] Гистограмма latency
-  - [ ] Количество активных соединений с БД
-  - [ ] `github.com/prometheus/client_golang/prometheus`
+- [x] **Prometheus-метрики** — `internal/handler/middleware/metrics.go`
+  - [x] `GET /metrics` — эндпоинт для Prometheus через `promhttp.Handler()`
+  - [x] `http_requests_total` (Counter) — количество запросов по method/path/status
+  - [x] `http_request_duration_seconds` (Histogram) — время обработки
+  - [x] `db_pool_active_connections` (Gauge) — активные соединения с БД
+  - [x] `db_pool_idle_connections` (Gauge) — свободные соединения
+  - [x] `db_pool_total_connections` (Gauge) — всего соединений
+  - [x] Middleware `Metrics` применён в цепочке middleware
 
-- [ ] **Dockerfile (multi-stage build)**
-  - [ ] Stage 1: `golang:1.22-alpine` — сборка бинарника
-  - [ ] Stage 2: `alpine:latest` — минимальный образ для запуска
-  - [ ] `CGO_ENABLED=0` для статического бинарника
-  - [ ] Обновить `docker-compose.yml`: добавить сервис `api`
-  - [ ] Проверить: `docker-compose build`, `docker-compose up`
+- [x] **Dockerfile (multi-stage build)**
+  - [x] Stage 1: `golang:1.24-alpine` — сборка бинарника
+  - [x] Stage 2: `alpine:3.19` — минимальный образ для запуска
+  - [x] `CGO_ENABLED=0` + `-ldflags="-s -w"` для статического бинарника
+  - [x] Non-root user `appuser` для безопасности
+  - [x] `HEALTHCHECK` инструкция в Dockerfile
+  - [x] `.dockerignore` — исключение ненужных файлов
 
-- [ ] **Собеседование по Этапу 2:**
-  - [ ] Что такое multi-stage build в Docker? Зачем он?
-  - [ ] Разница между liveness probe и readiness probe
-  - [ ] Как работает graceful shutdown в Kubernetes?
-  - [ ] Что такое индексы в PostgreSQL? B-tree vs Hash
-  - [ ] Когда индекс вреден?
+- [x] **docker-compose.yml обновлён**
+  - [x] Добавлен сервис `api` с `build: .`
+  - [x] `depends_on` с `condition: service_healthy` (ожидание БД)
+  - [x] Healthcheck для сервиса `api`
+  - [x] Environment variables передаются в контейнер
+
+- [x] **Middleware цепочка обновлена:**
+  - `RequestID → Metrics → Logging → mux → Handler`
+
+- [x] **Собеседование по Этапу 2:**
+  - [x] Multi-stage build в Docker
+  - [x] Liveness probe vs readiness probe
+  - [x] Graceful shutdown в Kubernetes
+  - [x] Prometheus-метрики: типы (Counter, Gauge, Histogram, Summary)
+  - [x] Middleware для метрик vs ручные вызовы
+  - [x] Индексы PostgreSQL: когда вредны, B-tree vs Hash
+  - [x] Подробности — в `INTERVIEW.md`
 
 ---
 
@@ -202,7 +217,10 @@
   - `staticcheck` — ✅
   - `golangci-lint` — ⚠️ typecheck ошибки (известная проблема v1.64+, не связана с кодом)
 - [x] Middleware логирования запросов (RequestID + Logging через slog)
-- [ ] Приложение запускается через `docker-compose up` (с сервисом `api`) — требуется Dockerfile (Этап 2)
+- [x] Приложение запускается через `docker-compose up` (с сервисом `api`)
+  - `Dockerfile` (multi-stage build)
+  - `docker-compose.yml` с сервисами `postgres` и `api`
+  - `depends_on` с `condition: service_healthy`
 - [x] Graceful shutdown работает (реализован)
 - [x] README обновлён с инструкцией "Как запустить" (Quick Start)
 - [x] INTERVIEW.md создан с вопросами/ответами для собеседования

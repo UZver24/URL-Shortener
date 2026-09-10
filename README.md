@@ -129,16 +129,60 @@ docker-compose down
 docker-compose down -v
 ```
 
+### Альтернатива: Запуск всего через Docker Compose
+
+```bash
+# Собрать и запустить всё (PostgreSQL + API)
+docker-compose up --build
+
+# Остановить
+docker-compose down
+
+# Остановить и удалить данные
+docker-compose down -v
+```
+
+Приложение будет доступно на `http://localhost:8080`.
+
 ---
 
 ## API Endpoints
 
 | Метод | Путь | Описание | Коды ответа |
 |-------|------|----------|-------------|
+| `GET` | `/health` | Health-check (readiness probe) | 200, 503 |
+| `GET` | `/metrics` | Prometheus-метрики | 200 |
 | `POST` | `/api/v1/links` | Создать короткую ссылку | 201, 400, 409 |
 | `GET` | `/{short}` | Редирект на оригинальный URL | 302, 404 |
 | `GET` | `/api/v1/links/{short}/stats` | Получить статистику | 200, 404 |
 | `DELETE` | `/api/v1/links/{short}` | Удалить ссылку | 204, 404 |
+
+### Health-check и метрики
+
+**Проверить здоровье приложения:**
+
+```bash
+curl http://localhost:8080/health
+```
+
+Ответ:
+
+```json
+{"status": "ok", "database": "ok"}
+```
+
+**Получить Prometheus-метрики:**
+
+```bash
+curl http://localhost:8080/metrics
+```
+
+Собираемые метрики:
+- `http_requests_total` — количество HTTP-запросов (method, path, status)
+- `http_request_duration_seconds` — время обработки запроса (гистограмма)
+- `db_pool_active_connections` — активные соединения с БД
+- `db_pool_idle_connections` — свободные соединения с БД
+- `db_pool_total_connections` — всего соединений в пуле
 
 ### Примеры запросов
 

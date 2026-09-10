@@ -15,6 +15,7 @@ import (
 	"github.com/UZver24/URL-Shortener/internal/handler"
 	"github.com/UZver24/URL-Shortener/internal/handler/middleware"
 	"github.com/UZver24/URL-Shortener/internal/repository/postgres"
+	redisrepo "github.com/UZver24/URL-Shortener/internal/repository/redis"
 	"github.com/UZver24/URL-Shortener/internal/service"
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
@@ -67,13 +68,35 @@ func main() {
 	// 5. Регистрируем метрики БД
 	registerDBMetrics(pool)
 
-	// 6. Инициализируем слои приложения
-	linkRepo := postgres.NewLinkRepository(pool)
-	linkService := service.NewLinkService(linkRepo, logger)
-	linkHandler := handler.NewLinkHandler(linkService)
-	healthHandler := handler.NewHealthHandler(pool)
+	// 6. Подключаемся к Redis (graceful degradation — если Redis недоступен, работаем без кэша)
+	var redisClient *redisrepo.Client
+	var linkCache service.LinkCache
 
-	// 7. Настраиваем маршруты
+	redisClient, err = redisrepo.NewClient(cfg.RedisAddr(), cfg.RedisPassword, cfg.RedisDB, logger)
+	if err != nil {
+		logger.Warn("failed to connect to Redis, running without cache", "error", err)
+		redisClient = nil
+	} else {
+		// Создаём кэш для ссылок
+		ttl := time.Duration(cfg.RedisTTL) * time.Second
+		linkCache = redisrepo.NewLinkCache(redisClient.GetClient(), logger, ttl)
+		logger.Info("Redis cache enabled", "ttl", ttl)
+	}
+
+	// 7. Инициализируем слои приложения
+	linkRepo := postgres.NewLinkRepository(pool)
+	linkService := service.NewLinkService(linkRepo, logger, linkCache)
+	linkHandler := handler.NewLinkHandler(linkService)
+
+	// Создаём HealthHandler с Redis (если доступен)
+	var healthHandler *handler.HealthHandler
+	if redisClient != nil {
+		healthHandler = handler.NewHealthHandler(pool, redisClient)
+	} else {
+		healthHandler = handler.NewHealthHandler(pool, nil)
+	}
+
+	// 8. Настраиваем маршруты
 	mux := http.NewServeMux()
 
 	// Health-check и метрики
@@ -88,11 +111,11 @@ func main() {
 	// Redirect endpoint (должен быть последним, так как перехватывает все GET /{short})
 	mux.HandleFunc("GET /{short}", linkHandler.Redirect)
 
-	// 8. Применяем middleware в правильном порядке (снаружи → внутрь):
+	// 9. Применяем middleware в правильном порядке (снаружи → внутрь):
 	//    Запрос → RequestID → Metrics → Logging → mux → Handler → Ответ
 	handler := middleware.RequestID(middleware.Metrics(middleware.Logging(logger)(mux)))
 
-	// 8. Создаём HTTP-сервер
+	// 10. Создаём HTTP-сервер
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.ServerPort),
 		Handler:      handler,
@@ -101,7 +124,7 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	// 9. Запускаем сервер в отдельной горутине
+	// 11. Запускаем сервер в отдельной горутине
 	go func() {
 		logger.Info("server started", "port", cfg.ServerPort)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -110,7 +133,7 @@ func main() {
 		}
 	}()
 
-	// 10. Graceful shutdown
+	// 12. Graceful shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-quit
@@ -124,7 +147,13 @@ func main() {
 
 	if err := server.Shutdown(ctx); err != nil {
 		logger.Error("server forced to shutdown", "error", err)
-		os.Exit(1)
+	}
+
+	// Закрываем Redis (если был подключён)
+	if redisClient != nil {
+		if err := redisClient.Close(); err != nil {
+			logger.Error("failed to close Redis connection", "error", err)
+		}
 	}
 
 	logger.Info("server stopped gracefully")

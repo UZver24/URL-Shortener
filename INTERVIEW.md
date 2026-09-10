@@ -1299,3 +1299,906 @@ CREATE INDEX idx_links_original_url ON links(original_url);
 ## Следующий этап
 
 После изучения этих вопросов переходим к **Этапу 3: Кэш (Redis)**.
+
+---
+
+# Собеседование по Этапу 3: Кэш (Redis)
+
+> Документация с типичными вопросами на техническом собеседовании и подробными ответами по теме кэширования и Redis.
+
+---
+
+## Основы кэширования
+
+### 1. Что такое кэширование и зачем оно нужно?
+
+**Ответ:**
+
+**Кэширование** — это временное хранение часто используемых данных в быстрой памяти (обычно in-memory) для ускорения доступа к ним.
+
+**Аналогия из жизни:**
+- **Без кэша:** Каждый раз, когда нужна книга, идёшь в библиотеку (БД)
+- **С кэшем:** Держишь популярные книги на столе (Redis) — берёшь мгновенно
+
+**Зачем нужно кэширование:**
+
+| Проблема без кэша | Решение с кэшем |
+|-------------------|-----------------|
+| Высокая latency (50-200ms на запрос к БД) | Низкая latency (1-5ms из Redis) |
+| Высокая нагрузка на БД (1000 RPS → 1000 запросов) | Снижение нагрузки (90% из кэша) |
+| Дорогое масштабирование БД | Дешёвое масштабирование кэша |
+| Ограниченная пропускная способность БД | Redis держит 100k+ RPS |
+
+**Когда кэш эффективен:**
+- **Read-heavy нагрузка:** 80%+ запросов — чтение (как в URL-сокращателе: `GET /{short}`)
+- **Повторяющиеся данные:** Одни и те же ссылки запрашиваются многократно
+- **Допустима eventual consistency:** Данные могут быть слегка устаревшими (TTL)
+
+**Когда кэш НЕ нужен:**
+- Write-heavy нагрузка (больше записей, чем чтений)
+- Данные меняются чаще, чем читаются
+- Требуется строгая consistency (банковские транзакции)
+
+**Для нашего проекта:**
+```
+80% запросов → GET /{short} (чтение из БД)
+↓
+С кэшем: 90% из Redis (1ms), 10% из PostgreSQL (50ms)
+↓
+Средняя latency: 0.9*1 + 0.1*50 = 5.9ms (вместо 50ms)
+```
+
+**Follow-up вопрос:** А если данные изменились в БД, а в кэше старые?
+
+**Ответ:** Это проблема **cache invalidation** (инвалидация кэша). Решения:
+1. **TTL (Time To Live):** Данные устаревают автоматически через N секунд
+2. **Инвалидация при изменении:** При `DELETE /links/{code}` удаляем из кэша
+3. **Write-through:** Пишем одновременно в БД и кэш (сложнее, но consistent)
+
+Мы используем **TTL + инвалидацию при удалении** — простой и эффективный подход.
+
+---
+
+### 2. Cache-aside vs Write-through vs Write-back: в чём разница?
+
+**Ответ:**
+
+Это три основных стратегии кэширования:
+
+#### Cache-aside (Lazy Loading)
+
+```
+Чтение:
+  1. Проверить кэш
+  2. Если есть → вернуть из кэша (cache hit)
+  3. Если нет → получить из БД (cache miss)
+  4. Сохранить в кэш
+  5. Вернуть данные
+
+Запись:
+  1. Записать в БД
+  2. НЕ обновлять кэш (ленивое кэширование)
+```
+
+**Плюсы:**
+- Простая реализация
+- Кэш содержит только "горячие" данные (те, что запрашиваются)
+- Устойчив к падению кэша (fallback к БД)
+
+**Минусы:**
+- Cache miss увеличивает latency (2 запроса: кэш + БД)
+- Данные в кэше могут устаревать (решается TTL)
+
+**Write-through**
+
+```
+Запись:
+  1. Записать в кэш
+  2. Записать в БД
+  3. Вернуть успех
+
+Чтение:
+  1. Прочитать из кэша (всегда hit, если записано)
+```
+
+**Плюсы:**
+- Данные в кэше всегда актуальны
+- Быстрое чтение (всегда cache hit)
+
+**Минусы:**
+- Медленная запись (2 операции)
+- Кэш может содержать "холодные" данные (которые редко читаются)
+- Сложная обработка ошибок (что если кэш упал?)
+
+**Write-back (Write-behind)**
+
+```
+Запись:
+  1. Записать в кэш
+  2. Вернуть успех (асинхронно)
+  3. Периодически синхронизировать кэш → БД (batch)
+
+Чтение:
+  1. Прочитать из кэша
+```
+
+**Плюсы:**
+- Очень быстрая запись (только кэш)
+- Снижение нагрузки на БД (batch updates)
+
+**Минусы:**
+- Риск потери данных (если кэш упал до синхронизации)
+- Сложная реализация (нужны воркеры, retry, dead letter queue)
+
+**Сравнительная таблица:**
+
+| Стратегия | Чтение | Запись | Consistency | Сложность | Когда использовать |
+|-----------|--------|--------|-------------|-----------|-------------------|
+| **Cache-aside** | Fast (hit) / Slow (miss) | Fast | Eventual | Низкая | Read-heavy, допустима eventual consistency |
+| **Write-through** | Always fast | Slow | Strong | Средняя | Write + read, нужна consistency |
+| **Write-back** | Always fast | Very fast | Weak | Высокая | Write-heavy, допустима потеря данных |
+
+**Для нашего проекта:**
+
+Мы выбрали **cache-aside** по нескольким причинам:
+1. **Read-heavy:** 80%+ запросов — `GET /{short}`
+2. **Простота:** Легко реализовать и отладить
+3. **Graceful degradation:** Если Redis упал, работаем с PostgreSQL
+4. **Экономия:** Кэш содержит только "горячие" ссылки
+
+**Код из нашего проекта:**
+
+```go
+func (s *LinkService) GetOriginalURL(ctx context.Context, code string) (string, error) {
+    // 1. Пробуем получить из кэша
+    if s.cache != nil {
+        link, err := s.cache.Get(ctx, code)
+        if err == nil {
+            // Cache hit — возвращаем из кэша
+            return link.OriginalURL, nil
+        }
+        // Cache miss — продолжаем с БД
+    }
+
+    // 2. Получаем из БД
+    link, err := s.repo.GetByCode(ctx, code)
+    if err != nil {
+        return "", err
+    }
+
+    // 3. Сохраняем в кэш (ленивое кэширование)
+    if s.cache != nil {
+        s.cache.Set(ctx, link)
+    }
+
+    return link.OriginalURL, nil
+}
+```
+
+---
+
+### 3. TTL и стратегии вытеснения (LRU, LFU, FIFO)
+
+**Ответ:**
+
+**TTL (Time To Live)** — время жизни записи в кэше. После истечения TTL данные автоматически удаляются.
+
+**Зачем нужен TTL:**
+1. **Инвалидация:** Данные устаревают автоматически
+2. **Освобождение памяти:** Предотвращает переполнение кэша
+3. **Consistency:** Баланс между скоростью и актуальностью
+
+**Как выбрать TTL:**
+
+| Тип данных | TTL | Пример |
+|------------|-----|--------|
+| Статические (не меняются) | Часы/дни | Конфигурация, справочники |
+| Полустатические | Минуты/часы | Профили пользователей |
+| Динамические | Секунды/минуты | Статистика, счётчики |
+| Сессии | Минуты | JWT tokens, корзины |
+
+**Для нашего проекта:**
+```bash
+REDIS_TTL=3600  # 1 час
+```
+
+Почему 1 час:
+- Ссылки редко меняются (создал → используется месяцами)
+- Статистика (`clicks`) может устаревать, но это не критично
+- Баланс между hit ratio и актуальностью
+
+#### Стратегии вытеснения (Eviction Policies)
+
+Когда кэш заполнен, нужно решить, какие данные удалить:
+
+**LRU (Least Recently Used)**
+
+Удаляет данные, которые не использовались дольше всех.
+
+```
+Кэш (максимум 3 элемента):
+  [A, B, C]
+  
+Запрос A → [A, B, C] (A обновлён)
+Запрос D → [D, A, B] (C вытеснен, так как использовался давно)
+```
+
+**Плюсы:**
+- Простая реализация
+- Хорошо работает для большинства сценариев
+
+**Минусы:**
+- Не учитывает частоту использования
+
+**LFU (Least Frequently Used)**
+
+Удаляет данные, которые используются реже всего.
+
+```
+Кэш:
+  A (10 запросов), B (5 запросов), C (1 запрос)
+  
+Запрос D → [A, B, D] (C вытеснен, так как использовался 1 раз)
+```
+
+**Плюсы:**
+- Учитывает популярность данных
+- Хорошо для "горячих" данных
+
+**Минусы:**
+- Сложная реализация (нужно считать частоту)
+- Может удерживать старые популярные данные
+
+**FIFO (First In, First Out)**
+
+Удаляет данные в порядке добавления.
+
+```
+Кэш:
+  [A (старый), B, C]
+  
+Запрос D → [B, C, D] (A вытеснен, так как добавлен первым)
+```
+
+**Плюсы:**
+- Очень простая реализация
+
+**Минусы:**
+- Не учитывает использование
+- Может вытеснить популярные данные
+
+**Сравнительная таблица:**
+
+| Стратегия | Реализация | Эффективность | Когда использовать |
+|-----------|------------|---------------|-------------------|
+| **LRU** | Средняя | Высокая | Универсальный выбор |
+| **LFU** | Сложная | Очень высокая | Есть чёткие "горячие" данные |
+| **FIFO** | Простая | Низкая | Временные данные (очереди) |
+| **Random** | Очень простая | Низкая | Нет паттерна доступа |
+
+**Redis eviction policies:**
+
+```bash
+# Настройка в redis.conf
+maxmemory 1gb
+maxmemory-policy allkeys-lru  # LRU для всех ключей
+```
+
+Доступные политики:
+- `noeviction` — не вытеснять (возвращать ошибку при переполнении)
+- `allkeys-lru` — LRU для всех ключей
+- `volatile-lru` — LRU только для ключей с TTL
+- `allkeys-lfu` — LFU для всех ключей
+- `volatile-ttl` — удалять ключи с наименьшим TTL
+
+**Для нашего проекта:**
+```bash
+maxmemory-policy allkeys-lru
+```
+
+Почему LRU:
+- Простая и эффективная стратегия
+- Автоматически вытесняет "холодные" ссылки
+- Redis реализует её оптимально (approximated LRU)
+
+---
+
+### 4. Инвалидация кэша: почему это сложно?
+
+**Ответ:**
+
+> "There are only two hard things in Computer Science: cache invalidation and naming things." — Phil Karlton
+
+**Инвалидация кэша** — это процесс удаления устаревших данных из кэша при изменении в БД.
+
+**Почему это сложно:**
+
+1. **Race conditions:**
+   ```
+   T1: Чтение из БД → [данные старые]
+   T2: Запись в БД → [данные новые]
+   T1: Запись в кэш → [кэш содержит старые данные]
+   ```
+
+2. **Distributed cache:**
+   ```
+   Сервер A: обновил БД, инвалидировал свой кэш
+   Сервер B: кэш всё ещё содержит старые данные
+   ```
+
+3. **Partial failures:**
+   ```
+   Запись в БД: успех
+   Инвалидация кэша: ошибка (Redis упал)
+   Результат: кэш содержит stale data
+   ```
+
+**Паттерны инвалидации:**
+
+#### 1. TTL-based (Time To Live)
+
+Данные устаревают автоматически через N секунд.
+
+```go
+cache.Set(ctx, key, value, 1*time.Hour)  // TTL = 1 час
+```
+
+**Плюсы:**
+- Простая реализация
+- Не нужна явная инвалидация
+
+**Минусы:**
+- Данные могут устаревать до истечения TTL
+- Сложно выбрать правильный TTL
+
+#### 2. Write-through invalidation
+
+При изменении данных обновляем и БД, и кэш.
+
+```go
+func (s *Service) UpdateLink(code string, newURL string) error {
+    // 1. Обновить БД
+    if err := s.repo.Update(code, newURL); err != nil {
+        return err
+    }
+    
+    // 2. Обновить кэш (или удалить)
+    s.cache.Delete(ctx, code)
+    
+    return nil
+}
+```
+
+**Плюсы:**
+- Данные в кэше всегда актуальны
+
+**Минусы:**
+- Сложная обработка ошибок
+- Увеличивает latency записи
+
+#### 3. Event-driven invalidation
+
+Используем message broker (Kafka, RabbitMQ) для уведомлений об изменениях.
+
+```
+Сервис A: обновил БД → опубликовал событие "link.updated"
+Сервис B: подписался на события → инвалидирует кэш при получении
+```
+
+**Плюсы:**
+- Работает в distributed системах
+- Decoupled (сервисы не знают друг о друге)
+
+**Минусы:**
+- Сложная инфраструктура
+- Возможна задержка (eventual consistency)
+
+#### 4. Cache-aside с инвалидацией
+
+Наш подход: кэш заполняется лениво, инвалидируется при изменении.
+
+```go
+func (s *Service) DeleteLink(code string) error {
+    // 1. Удалить из БД
+    if err := s.repo.Delete(code); err != nil {
+        return err
+    }
+    
+    // 2. Инвалидировать кэш
+    s.cache.Delete(ctx, code)
+    
+    return nil
+}
+```
+
+**Для нашего проекта:**
+
+Мы используем **TTL + cache-aside invalidation**:
+- **TTL = 1 час:** Данные устаревают автоматически
+- **Инвалидация при удалении:** `DELETE /links/{code}` удаляет из кэша
+- **Graceful degradation:** Если Redis упал, работаем с БД
+
+---
+
+## Redis vs Memcached
+
+### 5. Redis vs Memcached: когда что использовать?
+
+**Ответ:**
+
+| Критерий | Redis | Memcached |
+|----------|-------|-----------|
+| **Тип** | In-memory database | In-memory cache |
+| **Структуры данных** | String, Hash, List, Set, Sorted Set, Stream | Только String (key-value) |
+| **Персистентность** | RDB snapshots, AOF logs | Нет (только in-memory) |
+| **Репликация** | Master-slave, Sentinel, Cluster | Нет |
+| **Транзакции** | MULTI/EXEC (atomic) | Нет |
+| **Pub/Sub** | Есть | Нет |
+| **Lua scripts** | Есть | Нет |
+| **Производительность** | ~100k RPS | ~200k RPS (проще) |
+| **Использование памяти** | Выше (metadata, структуры) | Ниже (только key-value) |
+
+**Когда Redis:**
+- Нужны сложные структуры данных (sorted sets для leaderboards)
+- Нужна персистентность (не терять данные при перезапуске)
+- Нужна репликация (high availability)
+- Нужны транзакции (atomic operations)
+- Нужен pub/sub (real-time уведомления)
+
+**Когда Memcached:**
+- Только простое key-value кэширование
+- Максимальная производительность (2x быстрее Redis)
+- Минимальное использование памяти
+- Не нужна персистентность
+
+**Для нашего проекта:**
+
+Мы выбрали **Redis** по нескольким причинам:
+1. **JSON-сериализация:** Храним `model.Link` как JSON string
+2. **TTL:** Встроенная поддержка expiration
+3. **Персистентность:** Можно настроить RDB snapshots (опционально)
+4. **Экосистема:** Богатая библиотека клиентов для Go
+
+**Пример из нашего кода:**
+
+```go
+// Сохранение ссылки в Redis
+func (c *LinkCache) Set(ctx context.Context, link *model.Link) error {
+    key := fmt.Sprintf("link:%s", link.ShortCode)
+    
+    data, err := json.Marshal(link)
+    if err != nil {
+        return err
+    }
+    
+    // Set с TTL
+    return c.client.Set(ctx, key, data, c.ttl).Err()
+}
+
+// Получение из Redis
+func (c *LinkCache) Get(ctx context.Context, code string) (*model.Link, error) {
+    key := fmt.Sprintf("link:%s", code)
+    
+    data, err := c.client.Get(ctx, key).Bytes()
+    if err != nil {
+        if errors.Is(err, redis.Nil) {
+            return nil, model.ErrLinkNotFound  // Cache miss
+        }
+        return nil, err
+    }
+    
+    var link model.Link
+    if err := json.Unmarshal(data, &link); err != nil {
+        return nil, err
+    }
+    
+    return &link, nil
+}
+```
+
+---
+
+## Graceful Degradation
+
+### 6. Что такое graceful degradation и зачем нужно?
+
+**Ответ:**
+
+**Graceful degradation** — это стратегия, при которой система продолжает работать (с ограниченной функциональностью) при недоступности одного из компонентов.
+
+**Аналогия:**
+- **Без graceful degradation:** Если сломался лифт, ты не можешь подняться на этаж
+- **С graceful degradation:** Если сломался лифт, ты идёшь по лестнице (медленнее, но работает)
+
+**Для кэша:**
+
+```
+Нормальная работа:
+  Запрос → Redis (1ms) → Ответ
+  
+Redis упал:
+  Запрос → Redis (ошибка) → PostgreSQL (50ms) → Ответ
+```
+
+**Зачем нужно:**
+1. **Availability:** Система работает даже при partial failures
+2. **Resilience:** Устойчивость к сбоям зависимостей
+3. **User experience:** Пользователи не видят ошибок (только повышенная latency)
+
+**Как реализовать:**
+
+```go
+func (s *LinkService) GetOriginalURL(ctx context.Context, code string) (string, error) {
+    var link *model.Link
+    var err error
+
+    // 1. Пробуем кэш
+    if s.cache != nil {
+        link, err = s.cache.Get(ctx, code)
+        if err == nil {
+            // Cache hit
+            return link.OriginalURL, nil
+        }
+        // Cache miss или ошибка — логируем, но продолжаем
+        if !errors.Is(err, model.ErrLinkNotFound) {
+            s.logger.Warn("cache error, falling back to DB", "error", err)
+        }
+    }
+
+    // 2. Fallback к БД
+    link, err = s.repo.GetByCode(ctx, code)
+    if err != nil {
+        return "", err
+    }
+
+    // 3. Пытаемся сохранить в кэш (если доступен)
+    if s.cache != nil {
+        if err := s.cache.Set(ctx, link); err != nil {
+            s.logger.Warn("failed to cache", "error", err)
+            // Не возвращаем ошибку — это не критично
+        }
+    }
+
+    return link.OriginalURL, nil
+}
+```
+
+**Ключевые моменты:**
+1. **Проверка nil:** `if s.cache != nil` — кэш может быть отключён
+2. **Обработка ошибок:** Логируем, но не прерываем выполнение
+3. **Fallback:** Всегда есть запасной путь (БД)
+4. **Не критичные ошибки:** Ошибка кэша не влияет на ответ пользователю
+
+**Из нашего `main.go`:**
+
+```go
+// Подключаемся к Redis (graceful degradation)
+redisClient, err := redisrepo.NewClient(cfg.RedisAddr(), ...)
+if err != nil {
+    logger.Warn("failed to connect to Redis, running without cache", "error", err)
+    redisClient = nil  // Работаем без кэша
+} else {
+    linkCache = redisrepo.NewLinkCache(redisClient.GetClient(), logger, ttl)
+}
+
+// Передаём в сервис (cache может быть nil)
+linkService := service.NewLinkService(linkRepo, logger, linkCache)
+```
+
+**Тестирование graceful degradation:**
+
+```go
+func TestCacheAside_CacheError_FallbackToDB(t *testing.T) {
+    repo := newMockRepository()
+    cache := newMockCache()
+    cache.getErr = errors.New("redis connection error")  // Имитируем ошибку
+    svc := NewLinkService(repo, testLogger(), cache)
+
+    // Создаём ссылку в БД
+    repo.links["fallback"] = &model.Link{
+        ID: 1, ShortCode: "fallback", OriginalURL: "https://fallback.com",
+    }
+
+    // Получаем URL (кэш сломан, должен fallback к БД)
+    url, err := svc.GetOriginalURL(context.Background(), "fallback")
+    if err != nil {
+        t.Fatalf("expected no error (fallback to DB), got %v", err)
+    }
+
+    if url != "https://fallback.com" {
+        t.Errorf("expected 'https://fallback.com', got '%s'", url)
+    }
+}
+```
+
+---
+
+## Метрики для кэша
+
+### 7. Как измерять эффективность кэша (hit ratio)?
+
+**Ответ:**
+
+**Hit ratio** — это процент запросов, обслуженных из кэша.
+
+```
+Hit Ratio = Cache Hits / (Cache Hits + Cache Misses) * 100%
+```
+
+**Пример:**
+```
+За 1 час:
+  Cache hits: 9000
+  Cache misses: 1000
+  
+Hit ratio = 9000 / (9000 + 1000) * 100% = 90%
+```
+
+**Что считается хорошим hit ratio:**
+
+| Hit Ratio | Оценка | Действия |
+|-----------|--------|----------|
+| **>95%** | Отлично | Кэш работает оптимально |
+| **80-95%** | Хорошо | Можно оптимизировать TTL |
+| **50-80%** | Средне | Проверить паттерн доступа |
+| **<50%** | Плохо | Кэш неэффективен, пересмотреть стратегию |
+
+**Метрики для кэша:**
+
+```go
+// Prometheus метрики
+var (
+    cacheHitsTotal = promauto.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "cache_hits_total",
+            Help: "Total number of cache hits",
+        },
+        []string{"operation"},  // get, set, delete
+    )
+
+    cacheMissesTotal = promauto.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "cache_misses_total",
+            Help: "Total number of cache misses",
+        },
+        []string{"operation"},
+    )
+
+    cacheErrorsTotal = promauto.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "cache_errors_total",
+            Help: "Total number of cache errors",
+        },
+        []string{"operation"},
+    )
+)
+```
+
+**Запись метрик:**
+
+```go
+func (s *LinkService) GetOriginalURL(ctx context.Context, code string) (string, error) {
+    if s.cache != nil {
+        link, err := s.cache.Get(ctx, code)
+        if err == nil {
+            middleware.RecordCacheHit("get")
+            return link.OriginalURL, nil
+        }
+        if errors.Is(err, model.ErrLinkNotFound) {
+            middleware.RecordCacheMiss("get")
+        } else {
+            middleware.RecordCacheError("get")
+        }
+    }
+    // ...
+}
+```
+
+**PromQL запросы:**
+
+```promql
+# Hit ratio за последние 5 минут
+rate(cache_hits_total[5m]) / (rate(cache_hits_total[5m]) + rate(cache_misses_total[5m]))
+
+# Количество ошибок кэша
+rate(cache_errors_total[5m])
+
+# Latency кэша
+histogram_quantile(0.95, rate(cache_duration_seconds_bucket[5m]))
+```
+
+**Для нашего проекта:**
+
+Целевой hit ratio: **80-90%**
+
+Почему не 95%+:
+- Новые ссылки ещё не в кэше (cold start)
+- TTL = 1 час (данные устаревают)
+- Часть запросов — уникальные ссылки
+
+**Как улучшить hit ratio:**
+1. **Увеличить TTL:** 1 час → 24 часа (но данные устаревают дольше)
+2. **Pre-warming:** Загружать популярные ссылки в кэш при старте
+3. **Больше памяти:** Увеличить `maxmemory` в Redis
+
+---
+
+## Health-check с Redis
+
+### 8. Как обновить health-check для Redis?
+
+**Ответ:**
+
+**Health-check** должен проверять все критичные зависимости:
+- PostgreSQL (критично — без БД не работаем)
+- Redis (не критично — есть graceful degradation)
+
+**Из нашего `health_handler.go`:**
+
+```go
+type HealthHandler struct {
+    pool  *pgxpool.Pool
+    redis RedisPinger  // интерфейс, может быть nil
+}
+
+func (h *HealthHandler) Health(w http.ResponseWriter, r *http.Request) {
+    ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+    defer cancel()
+
+    // Проверяем PostgreSQL
+    dbStatus := "ok"
+    if err := h.pool.Ping(ctx); err != nil {
+        dbStatus = "error"
+    }
+
+    // Проверяем Redis (если доступен)
+    cacheStatus := ""
+    if h.redis != nil {
+        cacheStatus = "ok"
+        if err := h.redis.Ping(ctx); err != nil {
+            cacheStatus = "error"
+        }
+    }
+
+    // Формируем ответ
+    status := "ok"
+    httpStatus := http.StatusOK
+
+    if dbStatus != "ok" {
+        // БД критична — 503
+        status = "error"
+        httpStatus = http.StatusServiceUnavailable
+    }
+
+    resp := HealthResponse{
+        Status:   status,
+        Database: dbStatus,
+        Cache:    cacheStatus,  // "ok", "error", или "" (если Redis отключён)
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(httpStatus)
+    json.NewEncoder(w).Encode(resp)
+}
+```
+
+**Примеры ответов:**
+
+```bash
+# Всё работает
+curl http://localhost:8080/health
+{"status":"ok","database":"ok","cache":"ok"}
+
+# Redis упал (graceful degradation)
+curl http://localhost:8080/health
+{"status":"ok","database":"ok","cache":"error"}
+# HTTP 200 — приложение работает
+
+# PostgreSQL упал
+curl http://localhost:8080/health
+{"status":"error","database":"error","cache":"ok"}
+# HTTP 503 — приложение не работает
+```
+
+**Почему Redis error → HTTP 200:**
+- Redis не критичен (есть fallback к БД)
+- Приложение продолжает работать
+- Kubernetes не перезапустит pod (liveness probe проходит)
+
+**Почему PostgreSQL error → HTTP 503:**
+- БД критична (без неё не работаем)
+- Kubernetes перезапустит pod (readiness probe fails)
+
+---
+
+## Docker Compose с Redis
+
+### 9. Как добавить Redis в docker-compose?
+
+**Ответ:**
+
+**Из нашего `docker-compose.yml`:**
+
+```yaml
+services:
+  postgres:
+    image: postgres:16-alpine
+    # ...
+
+  redis:
+    image: redis:7-alpine
+    container_name: url-shortener-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: .
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ""
+      REDIS_DB: 0
+      REDIS_TTL: 3600
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:
+```
+
+**Ключевые моменты:**
+
+1. **Healthcheck:** `redis-cli ping` возвращает `PONG` если Redis работает
+2. **Volume:** `redis_data:/data` для персистентности (опционально)
+3. **depends_on:** API ждёт, пока Redis будет healthy
+4. **Environment:** Конфигурация через переменные окружения
+
+**Запуск:**
+
+```bash
+docker-compose up -d
+docker-compose ps
+# Проверяем, что все сервисы healthy
+
+docker-compose logs redis
+# Смотрим логи Redis
+```
+
+---
+
+## Итого
+
+**Ключевые темы для собеседования:**
+
+1. **Кэширование** — зачем нужно, когда эффективно, паттерны доступа
+2. **Cache-aside** — ленивое кэширование, простая реализация, graceful degradation
+3. **TTL** — время жизни данных, баланс между hit ratio и актуальностью
+4. **Инвалидация** — почему сложно, паттерны (TTL, write-through, event-driven)
+5. **Redis vs Memcached** — когда что использовать, структуры данных
+6. **Graceful degradation** — устойчивость к сбоям, fallback к БД
+7. **Метрики** — hit ratio, hits/misses/errors, monitoring
+8. **Health-check** — проверка зависимостей, HTTP 200 vs 503
+
+**Дополнительные вопросы для самопроверки:**
+- Что такое cache stampede (thundering herd) и как его избежать?
+- Как работает Redis Cluster (sharding, replication)?
+- Что такое Redis Pipeline и когда использовать?
+- Как выбрать правильный TTL для разных типов данных?
+- Что такое distributed cache и как синхронизировать между серверами?
+
+---
+
+## Следующий этап
+
+После изучения этих вопросов переходим к **Этапу 4: Конкурентность** (воркер-пул для асинхронной записи счётчиков).

@@ -3,12 +3,14 @@ package service
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/big"
 	"net/url"
 	"time"
 
+	"github.com/UZver24/URL-Shortener/internal/handler/middleware"
 	"github.com/UZver24/URL-Shortener/internal/model"
 )
 
@@ -21,16 +23,26 @@ type LinkRepository interface {
 	Delete(ctx context.Context, code string) error
 }
 
+// LinkCache — интерфейс для кэш-слоя
+type LinkCache interface {
+	Get(ctx context.Context, shortCode string) (*model.Link, error)
+	Set(ctx context.Context, link *model.Link) error
+	Delete(ctx context.Context, shortCode string) error
+}
+
 // LinkService реализует бизнес-логику для работы со ссылками
 type LinkService struct {
 	repo   LinkRepository
+	cache  LinkCache // опциональный кэш (может быть nil)
 	logger *slog.Logger
 }
 
 // NewLinkService создаёт новый сервис
-func NewLinkService(repo LinkRepository, logger *slog.Logger) *LinkService {
+// cache может быть nil — тогда работаем без кэша
+func NewLinkService(repo LinkRepository, logger *slog.Logger, cache LinkCache) *LinkService {
 	return &LinkService{
 		repo:   repo,
+		cache:  cache,
 		logger: logger,
 	}
 }
@@ -110,39 +122,124 @@ func (s *LinkService) CreateLink(ctx context.Context, originalURL string, custom
 }
 
 // GetOriginalURL возвращает оригинальный URL по короткому коду и увеличивает счётчик
+// Реализует cache-aside паттерн: сначала проверяем кэш, потом БД
 func (s *LinkService) GetOriginalURL(ctx context.Context, code string) (string, error) {
-	link, err := s.repo.GetByCode(ctx, code)
+	var link *model.Link
+	var err error
+
+	// 1. Пробуем получить из кэша (если кэш доступен)
+	if s.cache != nil {
+		link, err = s.cache.Get(ctx, code)
+		if err == nil {
+			// Cache hit — используем данные из кэша
+			s.logger.Debug("cache hit", "short_code", code)
+			middleware.RecordCacheHit("get")
+			// Асинхронно увеличиваем счётчик (не блокируем ответ)
+			go s.incrementClicksAsync(link.ID)
+			return link.OriginalURL, nil
+		}
+		// Cache miss или ошибка — продолжаем с БД
+		if errors.Is(err, model.ErrLinkNotFound) {
+			// Это cache miss
+			middleware.RecordCacheMiss("get")
+		} else {
+			// Это ошибка кэша
+			s.logger.Warn("cache get failed", "short_code", code, "error", err)
+			middleware.RecordCacheError("get")
+		}
+	}
+
+	// 2. Получаем из БД
+	link, err = s.repo.GetByCode(ctx, code)
 	if err != nil {
 		return "", err
 	}
 
-	// Асинхронно увеличиваем счётчик (не блокируем ответ)
-	go func() {
-		// Используем background context, так как оригинальный может быть отменён
+	// 3. Сохраняем в кэш (ленивое кэширование)
+	if s.cache != nil {
 		bgCtx := context.Background()
-		if err := s.repo.IncrementClicks(bgCtx, link.ID); err != nil {
-			s.logger.Error("failed to increment clicks",
-				"link_id", link.ID,
-				"error", err,
-			)
+		if err := s.cache.Set(bgCtx, link); err != nil {
+			s.logger.Warn("cache set failed", "short_code", code, "error", err)
+			middleware.RecordCacheError("set")
 		}
-	}()
+	}
+
+	// 4. Асинхронно увеличиваем счётчик (не блокируем ответ)
+	go s.incrementClicksAsync(link.ID)
 
 	return link.OriginalURL, nil
 }
 
-// GetStats возвращает статистику по ссылке
-func (s *LinkService) GetStats(ctx context.Context, code string) (*model.Link, error) {
-	return s.repo.GetByCode(ctx, code)
+// incrementClicksAsync увеличивает счётчик переходов в фоне
+func (s *LinkService) incrementClicksAsync(linkID int64) {
+	bgCtx := context.Background()
+	if err := s.repo.IncrementClicks(bgCtx, linkID); err != nil {
+		s.logger.Error("failed to increment clicks",
+			"link_id", linkID,
+			"error", err,
+		)
+	}
 }
 
-// DeleteLink удаляет ссылку
-func (s *LinkService) DeleteLink(ctx context.Context, code string) error {
-	err := s.repo.Delete(ctx, code)
-	if err == nil {
-		s.logger.Info("link deleted", "short_code", code)
+// GetStats возвращает статистику по ссылке
+// Также использует cache-aside паттерн
+func (s *LinkService) GetStats(ctx context.Context, code string) (*model.Link, error) {
+	var link *model.Link
+	var err error
+
+	// 1. Пробуем получить из кэша
+	if s.cache != nil {
+		link, err = s.cache.Get(ctx, code)
+		if err == nil {
+			s.logger.Debug("cache hit for stats", "short_code", code)
+			middleware.RecordCacheHit("get")
+			return link, nil
+		}
+		if errors.Is(err, model.ErrLinkNotFound) {
+			middleware.RecordCacheMiss("get")
+		} else {
+			s.logger.Warn("cache get failed for stats", "short_code", code, "error", err)
+			middleware.RecordCacheError("get")
+		}
 	}
-	return err
+
+	// 2. Получаем из БД
+	link, err = s.repo.GetByCode(ctx, code)
+	if err != nil {
+		return nil, err
+	}
+
+	// 3. Сохраняем в кэш
+	if s.cache != nil {
+		bgCtx := context.Background()
+		if err := s.cache.Set(bgCtx, link); err != nil {
+			s.logger.Warn("cache set failed for stats", "short_code", code, "error", err)
+			middleware.RecordCacheError("set")
+		}
+	}
+
+	return link, nil
+}
+
+// DeleteLink удаляет ссылку и инвалидирует кэш
+func (s *LinkService) DeleteLink(ctx context.Context, code string) error {
+	// 1. Удаляем из БД
+	err := s.repo.Delete(ctx, code)
+	if err != nil {
+		return err
+	}
+
+	// 2. Инвалидируем кэш
+	if s.cache != nil {
+		bgCtx := context.Background()
+		if err := s.cache.Delete(bgCtx, code); err != nil {
+			s.logger.Warn("cache delete failed", "short_code", code, "error", err)
+			middleware.RecordCacheError("delete")
+		}
+	}
+
+	s.logger.Info("link deleted", "short_code", code)
+	return nil
 }
 
 // isValidURL проверяет, является ли строка валидным URL

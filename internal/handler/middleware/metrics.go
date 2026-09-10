@@ -27,6 +27,31 @@ var (
 		},
 		[]string{"method", "path"},
 	)
+
+	// Метрики для кэша
+	cacheHitsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "cache_hits_total",
+			Help: "Total number of cache hits",
+		},
+		[]string{"operation"},
+	)
+
+	cacheMissesTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "cache_misses_total",
+			Help: "Total number of cache misses",
+		},
+		[]string{"operation"},
+	)
+
+	cacheErrorsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "cache_errors_total",
+			Help: "Total number of cache errors",
+		},
+		[]string{"operation"},
+	)
 )
 
 // metricsResponseWriter оборачивает ResponseWriter для перехвата status code
@@ -74,4 +99,19 @@ func Metrics(next http.Handler) http.Handler {
 			path,
 		).Observe(duration)
 	})
+}
+
+// RecordCacheHit записывает попадание в кэш
+func RecordCacheHit(operation string) {
+	cacheHitsTotal.WithLabelValues(operation).Inc()
+}
+
+// RecordCacheMiss записывает промах в кэше
+func RecordCacheMiss(operation string) {
+	cacheMissesTotal.WithLabelValues(operation).Inc()
+}
+
+// RecordCacheError записывает ошибку кэша
+func RecordCacheError(operation string) {
+	cacheErrorsTotal.WithLabelValues(operation).Inc()
 }

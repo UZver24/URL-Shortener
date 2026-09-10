@@ -118,10 +118,59 @@ func testLogger() *slog.Logger {
 	}))
 }
 
+// mockCache — мок-кэш для тестов cache-aside паттерна
+type mockCache struct {
+	data        map[string]*model.Link
+	getCalls    int
+	setCalls    int
+	deleteCalls int
+	getErr      error // принудительная ошибка Get
+	setErr      error // принудительная ошибка Set
+	deleteErr   error // принудительная ошибка Delete
+}
+
+func newMockCache() *mockCache {
+	return &mockCache{
+		data: make(map[string]*model.Link),
+	}
+}
+
+func (m *mockCache) Get(ctx context.Context, shortCode string) (*model.Link, error) {
+	m.getCalls++
+	if m.getErr != nil {
+		return nil, m.getErr
+	}
+	link, exists := m.data[shortCode]
+	if !exists {
+		return nil, model.ErrLinkNotFound
+	}
+	return link, nil
+}
+
+func (m *mockCache) Set(ctx context.Context, link *model.Link) error {
+	m.setCalls++
+	if m.setErr != nil {
+		return m.setErr
+	}
+	if link != nil {
+		m.data[link.ShortCode] = link
+	}
+	return nil
+}
+
+func (m *mockCache) Delete(ctx context.Context, shortCode string) error {
+	m.deleteCalls++
+	if m.deleteErr != nil {
+		return m.deleteErr
+	}
+	delete(m.data, shortCode)
+	return nil
+}
+
 // TestCreateLink_Success — успешное создание ссылки
 func TestCreateLink_Success(t *testing.T) {
 	repo := newMockRepository()
-	svc := NewLinkService(repo, testLogger())
+	svc := NewLinkService(repo, testLogger(), nil) // без кэша
 
 	link, err := svc.CreateLink(context.Background(), "https://example.com", "")
 	if err != nil {
@@ -148,7 +197,7 @@ func TestCreateLink_Success(t *testing.T) {
 // TestCreateLink_InvalidURL — невалидный URL
 func TestCreateLink_InvalidURL(t *testing.T) {
 	repo := newMockRepository()
-	svc := NewLinkService(repo, testLogger())
+	svc := NewLinkService(repo, testLogger(), nil)
 
 	testCases := []string{
 		"",
@@ -172,7 +221,7 @@ func TestCreateLink_InvalidURL(t *testing.T) {
 // TestCreateLink_DuplicateURL — повторное создание того же URL
 func TestCreateLink_DuplicateURL(t *testing.T) {
 	repo := newMockRepository()
-	svc := NewLinkService(repo, testLogger())
+	svc := NewLinkService(repo, testLogger(), nil)
 
 	// Первый запрос
 	link1, err := svc.CreateLink(context.Background(), "https://example.com", "")
@@ -200,7 +249,7 @@ func TestCreateLink_DuplicateURL(t *testing.T) {
 // TestCreateLink_CustomCode — пользовательский short_code
 func TestCreateLink_CustomCode(t *testing.T) {
 	repo := newMockRepository()
-	svc := NewLinkService(repo, testLogger())
+	svc := NewLinkService(repo, testLogger(), nil)
 
 	link, err := svc.CreateLink(context.Background(), "https://example.com", "custom")
 	if err != nil {
@@ -215,7 +264,7 @@ func TestCreateLink_CustomCode(t *testing.T) {
 // TestCreateLink_Collision — коллизия short_code и retry
 func TestCreateLink_Collision(t *testing.T) {
 	repo := newMockRepository()
-	svc := NewLinkService(repo, testLogger())
+	svc := NewLinkService(repo, testLogger(), nil)
 
 	// Создаём первую ссылку
 	_, err := svc.CreateLink(context.Background(), "https://example1.com", "abc123")
@@ -247,7 +296,7 @@ func TestCreateLink_Collision(t *testing.T) {
 // TestGetOriginalURL_Success — успешное получение URL
 func TestGetOriginalURL_Success(t *testing.T) {
 	repo := newMockRepository()
-	svc := NewLinkService(repo, testLogger())
+	svc := NewLinkService(repo, testLogger(), nil)
 
 	// Создаём ссылку
 	_, _ = svc.CreateLink(context.Background(), "https://example.com", "test123")
@@ -279,7 +328,7 @@ func TestGetOriginalURL_Success(t *testing.T) {
 // TestGetOriginalURL_NotFound — ссылка не найдена
 func TestGetOriginalURL_NotFound(t *testing.T) {
 	repo := newMockRepository()
-	svc := NewLinkService(repo, testLogger())
+	svc := NewLinkService(repo, testLogger(), nil)
 
 	_, err := svc.GetOriginalURL(context.Background(), "nonexistent")
 	if !errors.Is(err, model.ErrLinkNotFound) {
@@ -290,7 +339,7 @@ func TestGetOriginalURL_NotFound(t *testing.T) {
 // TestGetStats_Success — получение статистики
 func TestGetStats_Success(t *testing.T) {
 	repo := newMockRepository()
-	svc := NewLinkService(repo, testLogger())
+	svc := NewLinkService(repo, testLogger(), nil)
 
 	// Создаём ссылку
 	_, _ = svc.CreateLink(context.Background(), "https://example.com", "stats123")
@@ -313,7 +362,7 @@ func TestGetStats_Success(t *testing.T) {
 // TestDeleteLink_Success — успешное удаление
 func TestDeleteLink_Success(t *testing.T) {
 	repo := newMockRepository()
-	svc := NewLinkService(repo, testLogger())
+	svc := NewLinkService(repo, testLogger(), nil)
 
 	// Создаём ссылку
 	_, _ = svc.CreateLink(context.Background(), "https://example.com", "delete123")
@@ -338,7 +387,7 @@ func TestDeleteLink_Success(t *testing.T) {
 // TestDeleteLink_NotFound — удаление несуществующей ссылки
 func TestDeleteLink_NotFound(t *testing.T) {
 	repo := newMockRepository()
-	svc := NewLinkService(repo, testLogger())
+	svc := NewLinkService(repo, testLogger(), nil)
 
 	err := svc.DeleteLink(context.Background(), "nonexistent")
 	if !errors.Is(err, model.ErrLinkNotFound) {
@@ -397,4 +446,189 @@ func TestGenerateShortCode(t *testing.T) {
 		}
 		codes[code] = true
 	}
+}
+
+// ===== Тесты cache-aside паттерна =====
+
+// TestCacheAside_GetOriginalURL_Hit — получение URL из кэша (cache hit)
+func TestCacheAside_GetOriginalURL_Hit(t *testing.T) {
+	repo := newMockRepository()
+	cache := newMockCache()
+	svc := NewLinkService(repo, testLogger(), cache)
+
+	// Предзаполняем кэш
+	link := &model.Link{
+		ID:          1,
+		ShortCode:   "cached123",
+		OriginalURL: "https://cached.com",
+		Clicks:      10,
+	}
+	cache.data["cached123"] = link
+
+	// Получаем URL
+	url, err := svc.GetOriginalURL(context.Background(), "cached123")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if url != "https://cached.com" {
+		t.Errorf("expected 'https://cached.com', got '%s'", url)
+	}
+
+	// Должен быть 1 вызов cache.Get и 0 вызовов repo.GetByCode
+	if cache.getCalls != 1 {
+		t.Errorf("expected 1 cache.Get call, got %d", cache.getCalls)
+	}
+	if repo.getCodeCalls != 0 {
+		t.Errorf("expected 0 repo.GetByCode calls (cache hit), got %d", repo.getCodeCalls)
+	}
+
+	// Даём время для async increment
+	time.Sleep(10 * time.Millisecond)
+}
+
+// TestCacheAside_GetOriginalURL_Miss — cache miss: получение из БД + сохранение в кэш
+func TestCacheAside_GetOriginalURL_Miss(t *testing.T) {
+	repo := newMockRepository()
+	cache := newMockCache()
+	svc := NewLinkService(repo, testLogger(), cache)
+
+	// Создаём ссылку напрямую в репозиторий (кэш пустой)
+	repo.links["miss123"] = &model.Link{
+		ID:          1,
+		ShortCode:   "miss123",
+		OriginalURL: "https://miss.com",
+		Clicks:      5,
+	}
+
+	// Получаем URL (cache miss)
+	url, err := svc.GetOriginalURL(context.Background(), "miss123")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if url != "https://miss.com" {
+		t.Errorf("expected 'https://miss.com', got '%s'", url)
+	}
+
+	// Должен быть 1 cache miss + 1 repo.GetByCode + 1 cache.Set
+	if cache.getCalls != 1 {
+		t.Errorf("expected 1 cache.Get call, got %d", cache.getCalls)
+	}
+	if repo.getCodeCalls != 1 {
+		t.Errorf("expected 1 repo.GetByCode call, got %d", repo.getCodeCalls)
+	}
+	if cache.setCalls != 1 {
+		t.Errorf("expected 1 cache.Set call, got %d", cache.setCalls)
+	}
+
+	// Проверяем, что ссылка теперь в кэше
+	if _, exists := cache.data["miss123"]; !exists {
+		t.Error("expected link to be cached after miss")
+	}
+
+	// Даём время для async increment
+	time.Sleep(10 * time.Millisecond)
+}
+
+// TestCacheAside_GetStats_Hit — получение статистики из кэша
+func TestCacheAside_GetStats_Hit(t *testing.T) {
+	repo := newMockRepository()
+	cache := newMockCache()
+	svc := NewLinkService(repo, testLogger(), cache)
+
+	// Предзаполняем кэш
+	link := &model.Link{
+		ID:          1,
+		ShortCode:   "stats_cache",
+		OriginalURL: "https://stats.com",
+		Clicks:      100,
+	}
+	cache.data["stats_cache"] = link
+
+	// Получаем статистику
+	stats, err := svc.GetStats(context.Background(), "stats_cache")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if stats.Clicks != 100 {
+		t.Errorf("expected clicks=100, got %d", stats.Clicks)
+	}
+
+	// Должен быть 1 cache.Get и 0 repo.GetByCode
+	if cache.getCalls != 1 {
+		t.Errorf("expected 1 cache.Get call, got %d", cache.getCalls)
+	}
+	if repo.getCodeCalls != 0 {
+		t.Errorf("expected 0 repo.GetByCode calls (cache hit), got %d", repo.getCodeCalls)
+	}
+}
+
+// TestCacheAside_DeleteLink_InvalidatesCache — удаление инвалидирует кэш
+func TestCacheAside_DeleteLink_InvalidatesCache(t *testing.T) {
+	repo := newMockRepository()
+	cache := newMockCache()
+	svc := NewLinkService(repo, testLogger(), cache)
+
+	// Создаём ссылку
+	_, err := svc.CreateLink(context.Background(), "https://delete-cache.com", "del_cache")
+	if err != nil {
+		t.Fatalf("failed to create link: %v", err)
+	}
+
+	// Предзаполняем кэш (имитируем, что ссылка была закэширована)
+	cache.data["del_cache"] = &model.Link{
+		ID:          1,
+		ShortCode:   "del_cache",
+		OriginalURL: "https://delete-cache.com",
+	}
+
+	// Удаляем ссылку
+	err = svc.DeleteLink(context.Background(), "del_cache")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	// Проверяем, что кэш инвалидирован
+	if cache.deleteCalls != 1 {
+		t.Errorf("expected 1 cache.Delete call, got %d", cache.deleteCalls)
+	}
+	if _, exists := cache.data["del_cache"]; exists {
+		t.Error("expected link to be removed from cache")
+	}
+}
+
+// TestCacheAside_CacheError_FallbackToDB — ошибка кэша → fallback к БД
+func TestCacheAside_CacheError_FallbackToDB(t *testing.T) {
+	repo := newMockRepository()
+	cache := newMockCache()
+	cache.getErr = errors.New("redis connection error")
+	svc := NewLinkService(repo, testLogger(), cache)
+
+	// Создаём ссылку в БД
+	repo.links["fallback"] = &model.Link{
+		ID:          1,
+		ShortCode:   "fallback",
+		OriginalURL: "https://fallback.com",
+		Clicks:      0,
+	}
+
+	// Получаем URL (кэш сломан, должен fallback к БД)
+	url, err := svc.GetOriginalURL(context.Background(), "fallback")
+	if err != nil {
+		t.Fatalf("expected no error (fallback to DB), got %v", err)
+	}
+
+	if url != "https://fallback.com" {
+		t.Errorf("expected 'https://fallback.com', got '%s'", url)
+	}
+
+	// Должен быть 1 repo.GetByCode (fallback)
+	if repo.getCodeCalls != 1 {
+		t.Errorf("expected 1 repo.GetByCode call (fallback), got %d", repo.getCodeCalls)
+	}
+
+	// Даём время для async increment
+	time.Sleep(10 * time.Millisecond)
 }

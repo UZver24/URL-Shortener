@@ -3695,6 +3695,314 @@ A: Оптимизация без доказательств, что она ну�
 
 ---
 
+# Собеседование по Этапу 5-6: Микросервисы, конкурентность и production readiness
+
+> Вопросы и ответы по реальной архитектуре проекта, её недостаткам и пути к production.
+
+---
+
+## 1. Какие недостатки есть в текущей реализации и как их исправить?
+
+**Ответ:**
+
+| Недостаток | Почему плохо | Как исправить |
+|------------|--------------|---------------|
+| **Нет `gofmt`** | CI-линтер упадёт, код читается по-разному | `gofmt -w .` перед каждым коммитом |
+| **`err == model.ErrX` вместо `errors.Is`** | Не работает с обёрнутыми ошибками | Везде использовать `errors.Is` |
+| **Проверка дубликата через `"23505" in string** | Хак, зависит от формата ошибки | Привести к `*pgconn.PgError` и проверить `.Code == pgerrcode.UniqueViolation` |
+| **Fire-and-forget публикация в Kafka** | Потеря событий при shutdown, утечка goroutine | Ограниченный буфер + worker pool или batch writer |
+| **Stats handler отдаёт 404 на любую ошибку** | Скрывает 500, вводит клиента в заблуждение | Дифференцировать `ErrLinkNotFound` и внутренние ошибки |
+| **`go.mod` требует Go 1.27** | Такой версии не существует | Указать `go 1.23` или `go 1.24` |
+| **Нет rate limiting / auth / tracing** | Проект остаётся учебным | Реализовать Этап 7 production-ready |
+
+**Follow-up:** А стоит ли вообще идти в production без этих исправлений?
+
+**Ответ:** Нет. `gofmt`, корректная обработка ошибок и observability — это минимальный порог. Без rate limiting сервис можно положить одним скриптом, без auth — любой может удалять чужие ссылки.
+
+---
+
+## 2. Что такое Worker pool? Зачем он используется в проекте?
+
+**Ответ:**
+
+**Worker pool** — это пул горутин, которые берут задачи из общей очереди и выполняют их. Вместо того чтобы создавать горутину на каждую задачу, мы создаём фиксированное число воркеров, которые постоянно читают канал задач.
+
+**Зачем:**
+- Контроль над числом goroutine (не упасть от утечки).
+- Буферизация защищает от всплесков нагрузки.
+- Graceful shutdown — можно дождаться обработки очереди.
+- Retry и backoff делаются в одном месте.
+
+**В нашем проекте:**
+
+```
+HTTP redirect → публикация события → Worker pool → IncrementClicks в PostgreSQL
+```
+
+Без worker pool каждый redirect порождал бы goroutine с `UPDATE links SET clicks = clicks + 1`. При 1000 RPS это 1000 горутин и 1000 UPDATE в БД. Worker pool агрегирует нагрузку.
+
+**Код из проекта:**
+
+```go
+workerPool := worker.NewWorkerPool(worker.WorkerPoolConfig{
+    Workers:    5,
+    BufferSize: 1000,
+    Handler: func(ctx context.Context, task worker.Task) error {
+        return linkRepo.IncrementClicks(ctx, task.LinkID)
+    },
+})
+workerPool.Start()
+```
+
+---
+
+## 3. Почему нельзя просто запускать goroutine на каждый клик?
+
+**Ответ:**
+
+```go
+// Плохо: fire-and-forget
+go func() {
+    _ = repo.IncrementClicks(ctx, linkID)
+}()
+```
+
+**Проблемы:**
+
+| Проблема | Последствие |
+|----------|-------------|
+| **Утечка goroutine** | Если БД тормозит, горутины накапливаются |
+| **Нет контроля** | Не знаем, сколько задач в полёте |
+| **Потеря данных при shutdown** | Горутина прерывается, счётчик не обновится |
+| **Нет retry** | Одиночная ошибка БД = потеря клика |
+| **Нет backpressure** | При перегрузке ситуация только ухудшается |
+
+**Worker pool решает это:** фиксированное число воркеров, буфер, retry, graceful stop.
+
+---
+
+## 4. Что такое concurrency-задачи на Go? Приведите пример.
+
+**Ответ:**
+
+**Concurrency-задачи** — это задачи на управление параллельным выполнением: goroutine, каналы, мьютексы, пулы, rate limiter, fan-in/fan-out, graceful shutdown.
+
+**Пример из нашего проекта — Worker pool:**
+
+```go
+type Task struct {
+    LinkID    int64
+    ShortCode string
+}
+
+type WorkerPool struct {
+    tasks   chan Task
+    workers int
+    wg      sync.WaitGroup
+}
+
+func (p *WorkerPool) Start() {
+    for i := 0; i < p.workers; i++ {
+        p.wg.Add(1)
+        go p.worker()
+    }
+}
+
+func (p *WorkerPool) worker() {
+    defer p.wg.Done()
+    for task := range p.tasks {
+        process(task)
+    }
+}
+```
+
+**Другие примеры concurrency-задач на собеседовании:**
+
+1. **Fan-out / fan-in:** один producer, N workers, один consumer.
+2. **Rate limiter:** ограничить N запросов в секунду через bucket.
+3. **Graceful shutdown:** закрыть канал задач, дождаться `wg.Wait()`.
+4. **Простая задача:** `count words` в 10 файлах параллельно и собрать результат.
+5. **Pipeline:** `generator → filter → consumer` на каналах.
+
+**Что спрашивают на собеседовании:**
+- В чём разница `buffered` и `unbuffered` канала?
+- Когда deadlock?
+- Что делает `select` с `default`?
+- Как работает `sync.WaitGroup`?
+- Чем `sync.Mutex` отличается от канала?
+
+**Ответы:**
+- Buffered канал не блокирует отправителя, пока есть место.
+- Deadlock — когда все горутины ждут друг друга.
+- `select` с `default` делает неблокирующее чтение/запись.
+- `sync.WaitGroup` ждёт завершения группы горутин.
+- `Mutex` — для защиты общей памяти; канал — для передачи данных.
+
+---
+
+## 5. Как работает graceful shutdown в наших микросервисах?
+
+**Ответ:**
+
+```
+1. Получаем SIGTERM/SIGINT
+2. HTTP-сервер перестаёт принимать новые соединения (server.Shutdown)
+3. Даём активным запросам 30 секунд на завершение
+4. Останавливаем Worker pool / Kafka consumer
+5. Закрываем соединения с БД и Redis
+6. Выходим
+```
+
+**Важные моменты:**
+- Worker pool должен остановиться **до** закрытия БД, потому что воркеры пишут в БД.
+- Kafka consumer должен закоммитить offset и выйти.
+- Publisher не должен терять сообщения — лучше flush перед выходом.
+
+**Код из проекта:**
+
+```go
+quit := make(chan os.Signal, 1)
+signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+<-quit
+
+ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+
+server.Shutdown(ctx)
+workerPool.Stop()
+pool.Close()
+```
+
+**Follow-up:** А что, если shutdown занимает больше 30 секунд?
+
+**Ответ:** Kubernetes по умолчанию даёт 30 секунд (`terminationGracePeriodSeconds`). Если приложение не успело — приходит SIGKILL. Поэтому важно не ждать бесконечно, но и не терять задачи. Для критичных данных используют persistent queue (Kafka), а не in-memory worker pool.
+
+---
+
+## 6. Что будет, если Redis / PostgreSQL / Kafka упадут?
+
+**Ответ:**
+
+| Компонент | Что происходит | Поведение системы |
+|-----------|----------------|-------------------|
+| **Redis** | Недоступен | Link Service продолжает работать с PostgreSQL (graceful degradation). Метрики cache miss/error растут. Статистика из PostgreSQL медленнее, но доступна. |
+| **PostgreSQL** | Недоступен | Health-check возвращает 503, Kubernetes убирает pod из балансировки. Link Service не может создавать/удалять/редиректить. Stats Service не может писать статистику. События в Kafka накапливаются (consumer не коммитит offset), и после восстановления БД обработаются. |
+| **Kafka** | Недоступен | Link Service не может опубликовать click event. В текущей реализации событие теряется (fire-and-forget). В production нужен локальный буфер / dead letter queue / retry с сохранением на диск. |
+
+**Важно:** Redis — это кэш/индекс, PostgreSQL — source of truth. Потеря Redis = замедление, потеря PostgreSQL = остановка, потеря Kafka = потеря статистики (в текущей реализации).
+
+---
+
+## 7. Почему Gateway — это не просто "пересылальщик"?
+
+**Ответ:**
+
+API Gateway — это единая точка входа, но он решает серьёзные задачи:
+
+| Функция | Зачем |
+|---------|-------|
+| **Маршрутизация** | `/api/v1/links/*` → Link Service, `/api/v1/stats/*` → Stats Service |
+| **TLS termination** | HTTPS на входе, HTTP внутри кластера |
+| **Rate limiting** | Защита от DDoS и abuse |
+| **Authentication** | Проверка API Key / JWT |
+| **Observability** | Request ID, логи, метрики, tracing для всех сервисов |
+| **Retries / Circuit breaker** | Изоляция отказов downstream-сервисов |
+
+**В нашем проекте** Gateway делает только reverse proxy. В production нужно добавить auth, rate limiting и tracing.
+
+**Follow-up:** А почему не nginx как Gateway?
+
+**Ответ:** Можно nginx, но для сложной логики (auth по API Key, rate limiting с бизнес-правилами, tracing) удобнее собственный Gateway на Go. nginx оставляют для TLS termination и статики.
+
+---
+
+## 8. Как масштабировать нашу систему?
+
+**Ответ:**
+
+**Горизонтальное масштабирование:**
+
+```
+Client → Load Balancer → Gateway (N реплик)
+                              ↓
+            Link Service (N реплик) → PostgreSQL (read replicas / sharding)
+                              ↓
+                            Kafka
+                              ↓
+            Stats Service (N реплик) → PostgreSQL / ClickHouse
+```
+
+**Что масштабировать:**
+- **Gateway** — stateless, просто добавить реплик.
+- **Link Service** — stateless, масштабируется горизонтально. Redis — общий кэш.
+- **Stats Service** — consumer group Kafka: больше реплик = больше parallelism (но не больше числа партиций).
+- **PostgreSQL** — read replicas для чтения, шардинг по `short_code` для записи.
+- **Kafka** — увеличить число партиций в топике.
+- **Redis** — Redis Cluster для горизонтального масштабирования.
+
+**Кто даёт команду на масштабирование:**
+- Kubernetes HPA (Horizontal Pod Autoscaler) по CPU/RPS/queue size.
+- Инженер по эксплуатации по алертам.
+- CI/CD pipeline может развернуть больше реплик.
+
+---
+
+## 9. Когда переходить на ClickHouse?
+
+**Ответ:**
+
+**ClickHouse** — колоночная аналитическая БД, идеальна для:
+- больших объёмов событий (миллиарды кликов),
+- сложных агрегаций (топ по странам, устройствам, реферерам),
+- real-time и batch аналитики.
+
+**Когда переходить:**
+- PostgreSQL не справляется с записью click events (>10K/sec).
+- Запросы аналитики тормозят (full scan больших таблиц).
+- Нужно хранить сырые события дольше, чем позволяет PostgreSQL.
+
+**Важно:** ClickHouse — не замена PostgreSQL для транзакционных данных. Он заменяет именно аналитическое хранилище событий.
+
+**Архитектура с ClickHouse:**
+
+```
+Link Service → Kafka → Stats Service → ClickHouse (сырые события)
+                                      ↓
+                                 PostgreSQL (агрегаты, метаданные)
+```
+
+**Про Яндекс и Облако:** ClickHouse родился в Яндексе, и в Yandex Cloud есть managed ClickHouse. Это удобный стек для экосистемы Яндекса, но ClickHouse можно использовать в любом облаке.
+
+---
+
+## 10. В чём разница между микросервисами и контейнерами?
+
+**Ответ:**
+
+| Критерий | Микросервис | Контейнер |
+|----------|-------------|-----------|
+| **Это** | Архитектурный подход (как делим систему) | Технология упаковки (как запускаем) |
+| **Отвечает на вопрос** | Какие сервисы выделить? | Как упаковать сервис и зависимости? |
+| **Пример** | Link Service, Stats Service, Gateway | Docker-образы для этих сервисов |
+| **Масштабирование** | Независимое для каждого сервиса | Запуск N экземпляров образа |
+
+**В нашем проекте:** у нас 3 микросервиса, каждый упакован в свой Docker-образ и запускается как контейнер через docker-compose. Kubernetes оркестрирует эти контейнеры в production.
+
+---
+
+## Ключевые темы для собеседования
+
+1. **Worker pool** — управление goroutine, backpressure, graceful shutdown
+2. **Concurrency** — каналы, мьютексы, fan-out/fan-in, rate limiter
+3. **Graceful degradation** — Redis/PostgreSQL/Kafka недоступны
+4. **Error handling** — `errors.Is`, `pgconn.PgError`, дифференциация HTTP-кодов
+5. **Gateway** — не просто proxy, а auth/rate limit/tracing
+6. **Масштабирование** — HPA, read replicas, Kafka partitions, Redis Cluster
+7. **ClickHouse** — аналитическое хранилище для больших объёмов событий
+8. **Production readiness** — lint, CI/CD, auth, observability
+
+---
+
 ## Следующий этап
 
 После изучения этих вопросов переходим к **Этапу 7: Production-ready** — аутентификация, rate limiting, CI/CD.

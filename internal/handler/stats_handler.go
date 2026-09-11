@@ -36,13 +36,13 @@ func (h *StatsHandler) GetStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := map[string]interface{}{
-		"short":            statsData.ShortCode,
-		"original":         statsData.OriginalURL,
-		"total_clicks":     statsData.TotalClicks,
-		"unique_clicks":    statsData.UniqueClicks,
-		"last_clicked_at":  statsData.LastClickedAt,
-		"created_at":       statsData.CreatedAt,
-		"updated_at":       statsData.UpdatedAt,
+		"short":           statsData.ShortCode,
+		"original":        statsData.OriginalURL,
+		"total_clicks":    statsData.TotalClicks,
+		"unique_clicks":   statsData.UniqueClicks,
+		"last_clicked_at": statsData.LastClickedAt,
+		"created_at":      statsData.CreatedAt,
+		"updated_at":      statsData.UpdatedAt,
 	}
 
 	respondStatsJSON(w, http.StatusOK, resp)

@@ -68,8 +68,8 @@ func (w *WorkerPoolClickPublisher) Publish(ctx context.Context, event *kafkapkg.
 // LinkService реализует бизнес-логику для работы со ссылками
 type LinkService struct {
 	repo      LinkRepository
-	cache     LinkCache          // опциональный кэш (может быть nil)
-	publisher ClickPublisher     // опциональный publisher (Kafka или воркер-пул, может быть nil)
+	cache     LinkCache      // опциональный кэш (может быть nil)
+	publisher ClickPublisher // опциональный publisher (Kafka или воркер-пул, может быть nil)
 	logger    *slog.Logger
 }
 

@@ -26,9 +26,9 @@ type Config struct {
 	RedisTTL      int // TTL в секундах
 
 	// Kafka
-	KafkaBrokers     []string // Список брокеров Kafka
-	KafkaClicksTopic string   // Топик для событий кликов
-	KafkaConsumerGroup string // Consumer Group ID
+	KafkaBrokers       []string // Список брокеров Kafka
+	KafkaClicksTopic   string   // Топик для событий кликов
+	KafkaConsumerGroup string   // Consumer Group ID
 
 	// Worker Pool (для монолита, обратная совместимость)
 	WorkerCount      int // количество воркеров

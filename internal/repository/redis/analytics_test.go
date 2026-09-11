@@ -38,7 +38,7 @@ func TestAnalyticsCache_RecordUniqueClick(t *testing.T) {
 
 	// Записываем уникальные клики
 	for i := 0; i < 100; i++ {
-		visitorID := string(rune('a' + i%26)) + string(rune('0'+i/26))
+		visitorID := string(rune('a'+i%26)) + string(rune('0'+i/26))
 		err := cache.RecordUniqueClick(ctx, 1, visitorID)
 		if err != nil {
 			t.Fatalf("failed to record unique click: %v", err)

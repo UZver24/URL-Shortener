@@ -41,9 +41,9 @@ func NewProducer(cfg ProducerConfig) (*Producer, error) {
 		AllowAutoTopicCreation: true,
 		// Настройки надёжности
 		RequiredAcks: kafkago.RequireOne, // Ждём подтверждение от leader
-		MaxAttempts:  3,                   // Повторы при ошибках
+		MaxAttempts:  3,                  // Повторы при ошибках
 		// Настройки производительности
-		BatchSize:    100,                  // Батчинг сообщений
+		BatchSize:    100, // Батчинг сообщений
 		BatchTimeout: 10 * time.Millisecond,
 	}
 
